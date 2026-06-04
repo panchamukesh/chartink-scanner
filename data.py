@@ -1,13 +1,17 @@
 """
-Live market data — fetches OHLCV + technical indicators for the scan universe.
-Primary: yfinance (NSE via Yahoo Finance, no auth needed).
-Angel One LTP can overlay live prices if credentials are set.
+Live market data — 5-minute OHLCV bars from Yahoo Finance (NSE).
+
+Timeframe: 5m candles  (all indicators: EMA5, SMA50, RSI computed on 5m bars)
+Refresh:   every 60 s during market hours
+History:   10 trading days of 5m bars (~700 bars per symbol — enough for SMA50)
+
+Why 5m?  User's Pine Script runs on a 5-min chart.  We check every 1 min whether
+a new completed 5-min bar has triggered a buy/sell condition.
 """
 import os
 import math
 import threading
-import time as _time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import yfinance as yf
 import pandas as pd
@@ -61,221 +65,189 @@ UNIVERSE = [
     {"symbol": "IRCTC",      "name": "IRCTC",                     "sector": "Services"},
 ]
 
-# Yahoo Finance suffix for NSE
-YF_SUFFIX = ".NS"
+YF_SUFFIX  = ".NS"
+_IST       = timezone(timedelta(hours=5, minutes=30))
 
-# In-memory cache: symbol → stock dict
-_cache: dict = {}
-_cache_lock = threading.Lock()
-_last_refresh: datetime | None = None
+_cache:        dict     = {}
+_cache_lock             = threading.Lock()
+_last_refresh: datetime = None
 
 
-# ─── Technical indicators ─────────────────────────────────────────────────────
-def _rsi(close: pd.Series, period=14) -> pd.Series:
+# ─── Indicators ───────────────────────────────────────────────────────────────
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    return (100 - 100 / (1 + rs)).round(1)
+    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return (100 - 100 / (1 + rs)).round(2)
 
 
-def _compute(hist: pd.DataFrame, sym_info: dict) -> dict | None:
-    if hist is None or len(hist) < 52:
+def _safe(series: pd.Series, idx: int = -1) -> float:
+    try:
+        v = series.iloc[idx]
+        return float(v) if not math.isnan(float(v)) else 0.0
+    except Exception:
+        return 0.0
+
+
+# ─── Compute indicators from 5-min bars ──────────────────────────────────────
+def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
+    """
+    Compute all technical indicators on 5-minute OHLCV bars.
+    Requires at least 55 bars (≈ 275 min ≈ less than 1 trading day).
+    """
+    hist = hist.dropna(subset=["Close"])
+    if len(hist) < 55:
         return None
-    close  = hist["Close"].dropna()
-    volume = hist["Volume"].dropna()
-    if close.empty:
-        return None
 
+    close  = hist["Close"]
+    high   = hist["High"]
+    low    = hist["Low"]
+    volume = hist["Volume"]
+
+    # ── Indicators on 5m bars (matches Pine Script chart) ────────────────────
     ema5  = close.ewm(span=5,  adjust=False).mean()
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
-    rsi   = _rsi(close)
+    rsi   = _rsi(close, 14)
 
-    latest = hist.iloc[-1]
-    prev   = hist.iloc[-2] if len(hist) > 1 else hist.iloc[-1]
+    # Current and previous completed 5-min bar
+    cur_close  = _safe(close,  -1)
+    cur_open   = _safe(hist["Open"], -1)
+    cur_high   = _safe(high,   -1)
+    cur_low    = _safe(low,    -1)
+    cur_vol    = int(volume.iloc[-1]) if not math.isnan(volume.iloc[-1]) else 0
+    avg_vol    = int(volume.tail(20).mean())
 
-    prev_close = float(prev["Close"]) if float(prev["Close"]) != float(latest["Close"]) else float(hist["Close"].iloc[-3])
-    change_pct = round((float(latest["Close"]) - prev_close) / prev_close * 100, 2)
+    ema5_cur   = _safe(ema5,  -1)
+    ema5_prv   = _safe(ema5,  -2)
+    sma50_cur  = _safe(sma50, -1)
+    sma50_prv  = _safe(sma50, -2)
+    rsi_cur    = _safe(rsi,   -1) or 50.0
+    rsi_prv    = _safe(rsi,   -2) or 50.0
 
-    avg_vol = int(volume.tail(20).mean())
-    # Delivery estimate: higher on strong up days
-    delivery = min(85, max(20, 50 + change_pct * 4))
+    # Today's day-open (first bar of the current trading date)
+    ist_now    = datetime.now(_IST)
+    today_date = ist_now.date()
+    try:
+        today_bars = hist[hist.index.tz_convert(_IST).date == today_date]
+        day_open   = float(today_bars["Open"].iloc[0]) if not today_bars.empty else cur_open
+    except Exception:
+        day_open   = cur_open
 
-    rsi_val      = round(float(rsi.iloc[-1]),  1) if not math.isnan(rsi.iloc[-1])  else 50.0
-    rsi_prev     = round(float(rsi.iloc[-2]),  1) if len(rsi) > 1 and not math.isnan(rsi.iloc[-2]) else rsi_val
-    ema5_val     = round(float(ema5.iloc[-1]), 2)
-    ema5_prev    = round(float(ema5.iloc[-2]), 2) if len(ema5) > 1 else ema5_val
-    sma50_val    = round(float(sma50.iloc[-1]), 2)
-    sma50_prev   = round(float(sma50.iloc[-2]), 2) if len(sma50) > 1 else sma50_val
+    change_pct = round((cur_close - day_open) / day_open * 100, 2) if day_open else 0.0
 
-    # Swing trend colour (mirrors Pine Script mycolor logic)
-    low_val  = round(float(latest["Low"]),  2)
-    high_val = round(float(latest["High"]), 2)
-    if low_val > sma50_val:
+    # Resistance = highest high of all fetched bars (~10 trading days)
+    resistance = round(float(high.max()), 2)
+
+    # Swing trend (Pine Script "mycolor" logic on 5m bars)
+    if cur_low > sma50_cur:
         swing_trend = "bullish"
-    elif high_val < sma50_val:
+    elif cur_high < sma50_cur:
         swing_trend = "bearish"
     else:
         swing_trend = "mixed"
+
+    # Delivery % — not available intraday; estimated from volume ratio
+    delivery = min(85.0, max(20.0, 50.0 + change_pct * 4))
 
     return {
         "symbol":      sym_info["symbol"],
         "name":        sym_info["name"],
         "sector":      sym_info["sector"],
-        "close":       round(float(latest["Close"]), 2),
-        "open":        round(float(latest["Open"]),  2),
-        "high":        high_val,
-        "low":         low_val,
+        # OHLCV of latest 5-min bar
+        "close":       round(cur_close, 2),
+        "open":        round(cur_open,  2),
+        "high":        round(cur_high,  2),
+        "low":         round(cur_low,   2),
         "changePct":   change_pct,
-        "volume":      int(latest["Volume"]),
+        "volume":      cur_vol,
         "avgVolume":   avg_vol,
-        "rsi":         rsi_val,
-        "prev_rsi":    rsi_prev,
-        "ema5":        ema5_val,
-        "prev_ema5":   ema5_prev,
-        "ema20":       round(float(ema20.iloc[-1]), 2),
-        "ema50":       round(float(ema50.iloc[-1]), 2),
-        "sma20":       round(float(sma20.iloc[-1]), 2),
-        "sma50":       sma50_val,
-        "prev_sma50":  sma50_prev,
-        "resistance":  round(float(hist["High"].tail(260).max()), 2),
+        # Indicators (computed on 5m bars — same as Pine Script chart)
+        "rsi":         round(rsi_cur,   2),
+        "prev_rsi":    round(rsi_prv,   2),
+        "ema5":        round(ema5_cur,  2),
+        "prev_ema5":   round(ema5_prv,  2),
+        "ema20":       round(_safe(ema20, -1), 2),
+        "ema50":       round(_safe(ema50, -1), 2),
+        "sma20":       round(_safe(sma20, -1), 2),
+        "sma50":       round(sma50_cur,  2),
+        "prev_sma50":  round(sma50_prv,  2),
+        "resistance":  resistance,
         "delivery":    round(delivery, 1),
         "pe":          0,
         "swing_trend": swing_trend,
+        "timeframe":   "5m",
     }
 
 
-def refresh_all():
-    """Download 1-year daily data for all universe symbols, compute indicators, cache."""
+# ─── Main refresh (runs every 60 s during market hours) ──────────────────────
+def refresh_5m():
+    """
+    Download 10 days of 5-minute bars for all universe symbols.
+    Compute EMA5, SMA50, RSI (and all other indicators) on 5m bars.
+    Called both at market open and every 60 seconds intraday.
+    """
     global _last_refresh
     yf_symbols = [s["symbol"] + YF_SUFFIX for s in UNIVERSE]
-    print(f"[data] Fetching {len(yf_symbols)} symbols from Yahoo Finance …")
+
     try:
         raw = yf.download(
             yf_symbols,
-            period="1y",
-            interval="1d",
+            period="10d",        # 10 trading days → ~750 5m bars per symbol
+            interval="5m",
             group_by="ticker",
             auto_adjust=True,
             progress=False,
             threads=True,
         )
     except Exception as e:
-        print(f"[data] Download error: {e}")
+        print(f"[data] 5m download error: {e}")
         return
 
     updated = {}
     for sym_info in UNIVERSE:
         yf_sym = sym_info["symbol"] + YF_SUFFIX
         try:
-            if len(yf_symbols) == 1:
-                hist = raw
-            else:
-                hist = raw[yf_sym] if yf_sym in raw.columns.get_level_values(0) else None
-            result = _compute(hist, sym_info)
+            hist = raw[yf_sym] if len(yf_symbols) > 1 else raw
+            if hist is None or hist.empty:
+                continue
+            result = _compute_5m(hist, sym_info)
             if result:
-                # store yesterday's close for intraday changePct computation
-                result["_prev_close"] = result["close"]
                 updated[sym_info["symbol"]] = result
         except Exception as e:
-            print(f"[data] Error processing {sym_info['symbol']}: {e}")
+            print(f"[data] {sym_info['symbol']}: {e}")
 
     with _cache_lock:
         _cache.update(updated)
         _last_refresh = datetime.now()
 
-    print(f"[data] Daily data loaded: {len(updated)}/{len(UNIVERSE)} symbols at {_last_refresh.strftime('%H:%M:%S')}")
+    print(f"[data] 5m refresh ✓ {len(updated)}/{len(UNIVERSE)} symbols "
+          f"@ {_last_refresh.strftime('%H:%M:%S')} IST")
 
+
+# Keep old name as alias so server.py status endpoint still works
+def refresh_all():
+    refresh_5m()
 
 def refresh_intraday():
-    """
-    Pull today's 1-minute bars and overlay the latest LTP, volume, high, low,
-    changePct onto the cached daily indicators.  Fast — runs every 60s during market hours.
-    """
-    global _last_refresh
-    if not _cache:
-        return   # daily data not loaded yet
-
-    yf_symbols = [s["symbol"] + YF_SUFFIX for s in UNIVERSE]
-    try:
-        raw = yf.download(
-            yf_symbols,
-            period="1d",
-            interval="1m",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:
-        print(f"[data] Intraday download error: {e}")
-        return
-
-    updated = 0
-    with _cache_lock:
-        for sym_info in UNIVERSE:
-            sym    = sym_info["symbol"]
-            yf_sym = sym + YF_SUFFIX
-            if sym not in _cache:
-                continue
-            try:
-                if len(yf_symbols) == 1:
-                    bars = raw
-                else:
-                    bars = raw[yf_sym] if yf_sym in raw.columns.get_level_values(0) else None
-
-                if bars is None or bars.empty:
-                    continue
-
-                last_bar  = bars.iloc[-1]
-                ltp       = round(float(last_bar["Close"]), 2)
-                today_vol = int(bars["Volume"].sum())
-                today_hi  = round(float(bars["High"].max()),  2)
-                today_lo  = round(float(bars["Low"].min()),   2)
-
-                prev_close = _cache[sym].get("_prev_close", ltp)
-                change_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
-
-                _cache[sym]["close"]     = ltp
-                _cache[sym]["high"]      = today_hi
-                _cache[sym]["low"]       = today_lo
-                _cache[sym]["volume"]    = today_vol
-                _cache[sym]["changePct"] = change_pct
-
-                # Update swing trend with live price
-                sma50 = _cache[sym].get("sma50", ltp)
-                if today_lo > sma50:
-                    _cache[sym]["swing_trend"] = "bullish"
-                elif today_hi < sma50:
-                    _cache[sym]["swing_trend"] = "bearish"
-                else:
-                    _cache[sym]["swing_trend"] = "mixed"
-
-                updated += 1
-            except Exception:
-                pass
-
-        _last_refresh = datetime.now()
-
-    print(f"[data] Intraday update: {updated} stocks at {_last_refresh.strftime('%H:%M:%S')}")
+    refresh_5m()
 
 
+# ─── Accessors ────────────────────────────────────────────────────────────────
 def get_all() -> list[dict]:
-    """Return cached stock data list."""
     with _cache_lock:
         return list(_cache.values())
 
 
 def get_eod_prices() -> dict:
-    """Return symbol → current close price (for EOD update)."""
     with _cache_lock:
         return {sym: s["close"] for sym, s in _cache.items()}
 
 
-def is_stale(max_minutes=10) -> bool:
+def is_stale(max_minutes: int = 3) -> bool:
     if _last_refresh is None:
         return True
     return (datetime.now() - _last_refresh).seconds > max_minutes * 60

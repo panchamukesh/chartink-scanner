@@ -261,25 +261,25 @@ def _loop():
             eod_sent_today = False
             _active.clear()   # reset state so day's fresh conditions trigger cleanly
 
-        # ── Market open: load daily data once ────────────────────────────────
+        # ── Market open: initial 5m data load ────────────────────────────────
         if _is_market_open() and not opened_today:
-            print("[scanner] 🔔 Market open — loading daily data for all 45 stocks …")
+            print("[scanner] 🔔 Market open — loading 5-min bars for all 45 stocks …")
             try:
-                _data.refresh_all()
+                _data.refresh_5m()
                 opened_today = True
-                print("[scanner] Daily data ready — scanning every 60 seconds")
+                print("[scanner] ✅ 5m data ready — scanning every 60 seconds on 5-min timeframe")
             except Exception as e:
-                print(f"[scanner] Daily data error: {e}")
+                print(f"[scanner] 5m load error: {e}")
 
-        # ── Intraday: refresh live prices + scan every 60 seconds ─────────────
+        # ── Every 60 seconds: refresh 5m bars + run scan ──────────────────────
         if _is_market_open() and opened_today:
             if last_scan is None or (now - last_scan).seconds >= 60:
                 try:
-                    _data.refresh_intraday()   # update LTP / volume / changePct
+                    _data.refresh_5m()      # fetch latest completed 5-min bar
                 except Exception as e:
-                    print(f"[scanner] Intraday refresh error: {e}")
+                    print(f"[scanner] 5m refresh error: {e}")
                 try:
-                    _run_scan_cycle()
+                    _run_scan_cycle()       # check conditions, alert only on new entries
                 except Exception as e:
                     print(f"[scanner] Scan error: {e}")
                 last_scan = now
