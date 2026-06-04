@@ -1294,4 +1294,88 @@ async function sendTelegramAlert(results, scanName) {
   updateTelegramStatusBadge();
 }
 
+// ─── Signal History (fetched from backend /api/signals/*) ────────────────────
+function setupSignalsView() {
+  document.getElementById("refreshSignals").addEventListener("click", loadSignals);
+  document.getElementById("signalDaysFilter").addEventListener("change", loadSignals);
+  loadSignals();
+}
+
+async function loadSignals() {
+  const days = document.getElementById("signalDaysFilter").value;
+  const isToday = days === "1";
+  const subtitle = document.getElementById("signalSubtitle");
+  subtitle.textContent = "Loading…";
+
+  try {
+    const [sigRes, sumRes] = await Promise.all([
+      fetch(`/api/signals/${isToday ? "today" : `history?days=${days}`}`),
+      fetch("/api/signals/summary"),
+    ]);
+
+    if (!sigRes.ok) throw new Error("backend unavailable");
+    const signals = await sigRes.json();
+    const summary = sumRes.ok ? await sumRes.json() : null;
+
+    renderSummaryBar(summary);
+    renderSignalsTable(signals);
+    subtitle.textContent = `${signals.length} signal${signals.length !== 1 ? "s" : ""} — auto-scanned 10:00–15:30 IST`;
+  } catch {
+    subtitle.textContent = "Backend offline — signals require the Flask server (python server.py).";
+    document.getElementById("signalsBody").innerHTML =
+      `<tr><td colspan="12" style="text-align:center;padding:32px;color:var(--muted)">
+        Start the server: <code>python server.py</code> on the VM or locally.
+      </td></tr>`;
+    document.getElementById("signalSummaryBar").innerHTML = "";
+  }
+}
+
+function renderSummaryBar(s) {
+  const bar = document.getElementById("signalSummaryBar");
+  if (!s) { bar.innerHTML = ""; return; }
+  const pnlColor = s.avg_pnl >= 0 ? "var(--green)" : "var(--red)";
+  bar.innerHTML = `
+    <div class="sum-card"><span>Today's Signals</span><strong>${s.total}</strong></div>
+    <div class="sum-card green"><span>Targets Hit ✅</span><strong>${s.hits}</strong></div>
+    <div class="sum-card red"><span>SL Hit ❌</span><strong>${s.sl_hits}</strong></div>
+    <div class="sum-card"><span>Open ⏳</span><strong>${s.open}</strong></div>
+    <div class="sum-card"><span>Win Rate</span><strong>${s.win_rate}%</strong></div>
+    <div class="sum-card" style="--c:${pnlColor}"><span>Avg P&L</span><strong style="color:${pnlColor}">${s.avg_pnl >= 0 ? "+" : ""}${s.avg_pnl}%</strong></div>
+  `;
+}
+
+function renderSignalsTable(signals) {
+  const body = document.getElementById("signalsBody");
+  if (!signals.length) {
+    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:32px;color:var(--muted)">No signals yet. Scanner fires during market hours (10:00–15:30 IST).</td></tr>`;
+    return;
+  }
+  body.innerHTML = signals.map((s) => {
+    const resultLabel = s.target_hit ? "✅ Target" : s.sl_hit ? "❌ SL Hit" : s.eod_price ? "⏳ Closed" : "⏳ Open";
+    const resultClass = s.target_hit ? "sig-target" : s.sl_hit ? "sig-sl" : "sig-open";
+    const pnl = s.pnl_pct != null ? `<span class="${s.pnl_pct >= 0 ? "positive" : "negative"}">${s.pnl_pct >= 0 ? "+" : ""}${s.pnl_pct.toFixed(2)}%</span>` : "—";
+    const typeClass = s.signal_type === "BUY" ? "sig-buy" : "sig-sell";
+    return `<tr>
+      <td>${s.date}</td>
+      <td>${s.time}</td>
+      <td><strong>${s.symbol}</strong><br><small style="color:var(--muted)">${s.name || ""}</small></td>
+      <td>${s.sector || "—"}</td>
+      <td><span class="sig-type ${typeClass}">${s.signal_type}</span></td>
+      <td style="font-size:12px">${s.scan_name || "—"}</td>
+      <td>₹${Number(s.price).toLocaleString("en-IN", {maximumFractionDigits:2})}</td>
+      <td class="positive">₹${Number(s.target).toLocaleString("en-IN", {maximumFractionDigits:2})}</td>
+      <td class="negative">₹${Number(s.sl).toLocaleString("en-IN", {maximumFractionDigits:2})}</td>
+      <td>${s.eod_price ? "₹" + Number(s.eod_price).toLocaleString("en-IN", {maximumFractionDigits:2}) : "—"}</td>
+      <td>${pnl}</td>
+      <td><span class="sig-result ${resultClass}">${resultLabel}</span></td>
+    </tr>`;
+  }).join("");
+}
+
 boot();
+
+// Load signals tab when navigated to
+document.addEventListener("DOMContentLoaded", () => {
+  setupSignalsView();
+  document.querySelector('.nav-item[data-view="signals"]').addEventListener("click", loadSignals);
+});
