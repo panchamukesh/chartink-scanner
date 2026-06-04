@@ -139,30 +139,56 @@ def _calc_targets(price, signal_type, is_swing=False):
     return round(price * (1 + tgt_pct / 100), 2), round(price * (1 + sl_pct / 100), 2)
 
 
+# ── State tracker: rule_key → set of symbols currently matching ───────────────
+# A Telegram alert fires ONLY when a symbol newly ENTERS the matching set.
+# No alert if it was already there last cycle — even after 100 cycles.
+# Alert fires again only when it EXITS and then re-ENTERS.
+_active: dict = {}   # rule_key → set[symbol]
+
+
 def _run_scan_cycle():
-    """Evaluate all active rules against cached stock data and fire new signals."""
+    """
+    Evaluate all rules against cached stock data.
+    Alerts only for symbols that NEWLY match this cycle (weren't matching last cycle).
+    """
     stocks = _data.get_all()
     if not stocks:
-        print("[scanner] No cached data — skipping cycle")
+        print("[scanner] No cached data — skipping")
         return
 
     fired = 0
     for rule in ACTIVE_RULES:
+        rkey = rule["key"]
+        prev_set = _active.get(rkey, set())
+        curr_set = set()
+
         for stock in stocks:
             try:
-                if not rule["cond"](stock):
-                    continue
+                if rule["cond"](stock):
+                    curr_set.add(stock["symbol"])
             except Exception:
                 continue
 
-            if _db.already_signaled(stock["symbol"], rule["name"]):
+        # Only symbols that NEWLY entered the condition this cycle
+        new_entries = curr_set - prev_set
+        _active[rkey] = curr_set   # update state regardless
+
+        for symbol in new_entries:
+            stock = next((s for s in stocks if s["symbol"] == symbol), None)
+            if not stock:
                 continue
 
-            price = stock["close"]
-            is_swing = rule["key"] in PINE_KEYS
+            # Secondary DB guard: skip if same rule fired for this stock
+            # within the last 2 hours (protects against state resets on restart)
+            if _db.already_signaled(symbol, rule["name"], cooldown_min=120):
+                continue
+
+            price    = stock["close"]
+            is_swing = rkey in PINE_KEYS
             target, sl = _calc_targets(price, rule["signal"], is_swing=is_swing)
+
             sig_id = _db.insert_signal(
-                symbol      = stock["symbol"],
+                symbol      = symbol,
                 name        = stock["name"],
                 sector      = stock["sector"],
                 signal_type = rule["signal"],
@@ -173,12 +199,12 @@ def _run_scan_cycle():
             )
             signal = dict(
                 id          = sig_id,
-                symbol      = stock["symbol"],
+                symbol      = symbol,
                 name        = stock["name"],
                 sector      = stock["sector"],
                 signal_type = rule["signal"],
                 scan_name   = rule["name"],
-                scan_key    = rule["key"],
+                scan_key    = rkey,
                 price       = price,
                 target      = target,
                 sl          = sl,
@@ -187,10 +213,10 @@ def _run_scan_cycle():
             )
             _notify.send_signal(signal)
             fired += 1
-            print(f"[scanner] Signal: {rule['signal']} {stock['symbol']} via '{rule['name']}'")
+            print(f"[scanner] 🔔 {rule['signal']} {symbol} — {rule['name']}")
 
     if fired:
-        print(f"[scanner] Cycle complete — {fired} new signal(s) fired")
+        print(f"[scanner] {fired} new signal(s) sent at {_ist_now().strftime('%H:%M:%S')}")
 
 
 def _eod_report():
@@ -211,45 +237,57 @@ def _eod_report():
 
 
 def _loop():
-    """Background thread: data refresh at 10 AM, scan every 5 min, EOD at 15:35."""
-    opened_today = False
-    eod_sent_today = False
-    last_scan = None
+    """
+    Background thread — fully automatic, no user interaction needed.
 
-    print("[scanner] Background loop started")
+    Schedule (IST):
+      10:00       — load 1-year daily data (indicators: EMA5, SMA50, RSI, etc.)
+      10:00-15:30 — refresh live 1-min bars + run scan rules EVERY 60 SECONDS
+                    alert fires only when a stock NEWLY enters a scan condition
+      15:35       — EOD report: target/SL hit status, P&L%, consolidated Telegram message
+    """
+    opened_today   = False
+    eod_sent_today = False
+    last_scan      = None
+
+    print("[scanner] Auto-scanner started — will activate at next market open (10:00 IST)")
 
     while True:
         now = _ist_now()
 
-        # Reset flags at midnight
-        if now.hour == 0 and now.minute == 0:
-            opened_today = False
+        # ── Midnight reset ────────────────────────────────────────────────────
+        if now.hour == 0 and now.minute < 1:
+            opened_today   = False
             eod_sent_today = False
+            _active.clear()   # reset state so day's fresh conditions trigger cleanly
 
-        # Market open — refresh data once
+        # ── Market open: load daily data once ────────────────────────────────
         if _is_market_open() and not opened_today:
-            print("[scanner] Market opened — loading fresh data …")
+            print("[scanner] 🔔 Market open — loading daily data for all 45 stocks …")
             try:
                 _data.refresh_all()
+                opened_today = True
+                print("[scanner] Daily data ready — scanning every 60 seconds")
             except Exception as e:
-                print(f"[scanner] Data refresh error: {e}")
-            opened_today = True
+                print(f"[scanner] Daily data error: {e}")
 
-        # Intraday scan every 5 minutes
-        if _is_market_open():
-            if last_scan is None or (now - last_scan).seconds >= 300:
+        # ── Intraday: refresh live prices + scan every 60 seconds ─────────────
+        if _is_market_open() and opened_today:
+            if last_scan is None or (now - last_scan).seconds >= 60:
                 try:
-                    if _data.is_stale(max_minutes=10):
-                        _data.refresh_all()
+                    _data.refresh_intraday()   # update LTP / volume / changePct
+                except Exception as e:
+                    print(f"[scanner] Intraday refresh error: {e}")
+                try:
                     _run_scan_cycle()
                 except Exception as e:
                     print(f"[scanner] Scan error: {e}")
                 last_scan = now
 
-        # EOD report at 15:35 IST
-        from datetime import time
+        # ── EOD report at 15:35 ───────────────────────────────────────────────
+        from datetime import time as _time_t
         if (now.weekday() < 5
-                and now.time() >= time(15, 35)
+                and now.time() >= _time_t(15, 35)
                 and not eod_sent_today):
             try:
                 _eod_report()
@@ -257,7 +295,7 @@ def _loop():
                 print(f"[scanner] EOD error: {e}")
             eod_sent_today = True
 
-        _time.sleep(30)   # check every 30 seconds
+        _time.sleep(15)   # tight loop — 15s sleep so 60s trigger is accurate
 
 
 def start():

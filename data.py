@@ -177,6 +177,8 @@ def refresh_all():
                 hist = raw[yf_sym] if yf_sym in raw.columns.get_level_values(0) else None
             result = _compute(hist, sym_info)
             if result:
+                # store yesterday's close for intraday changePct computation
+                result["_prev_close"] = result["close"]
                 updated[sym_info["symbol"]] = result
         except Exception as e:
             print(f"[data] Error processing {sym_info['symbol']}: {e}")
@@ -185,7 +187,80 @@ def refresh_all():
         _cache.update(updated)
         _last_refresh = datetime.now()
 
-    print(f"[data] Refreshed {len(updated)}/{len(UNIVERSE)} symbols at {_last_refresh.strftime('%H:%M:%S')}")
+    print(f"[data] Daily data loaded: {len(updated)}/{len(UNIVERSE)} symbols at {_last_refresh.strftime('%H:%M:%S')}")
+
+
+def refresh_intraday():
+    """
+    Pull today's 1-minute bars and overlay the latest LTP, volume, high, low,
+    changePct onto the cached daily indicators.  Fast — runs every 60s during market hours.
+    """
+    global _last_refresh
+    if not _cache:
+        return   # daily data not loaded yet
+
+    yf_symbols = [s["symbol"] + YF_SUFFIX for s in UNIVERSE]
+    try:
+        raw = yf.download(
+            yf_symbols,
+            period="1d",
+            interval="1m",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        print(f"[data] Intraday download error: {e}")
+        return
+
+    updated = 0
+    with _cache_lock:
+        for sym_info in UNIVERSE:
+            sym    = sym_info["symbol"]
+            yf_sym = sym + YF_SUFFIX
+            if sym not in _cache:
+                continue
+            try:
+                if len(yf_symbols) == 1:
+                    bars = raw
+                else:
+                    bars = raw[yf_sym] if yf_sym in raw.columns.get_level_values(0) else None
+
+                if bars is None or bars.empty:
+                    continue
+
+                last_bar  = bars.iloc[-1]
+                ltp       = round(float(last_bar["Close"]), 2)
+                today_vol = int(bars["Volume"].sum())
+                today_hi  = round(float(bars["High"].max()),  2)
+                today_lo  = round(float(bars["Low"].min()),   2)
+
+                prev_close = _cache[sym].get("_prev_close", ltp)
+                change_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+                _cache[sym]["close"]     = ltp
+                _cache[sym]["high"]      = today_hi
+                _cache[sym]["low"]       = today_lo
+                _cache[sym]["volume"]    = today_vol
+                _cache[sym]["changePct"] = change_pct
+
+                # Update swing trend with live price
+                sma50 = _cache[sym].get("sma50", ltp)
+                if today_lo > sma50:
+                    _cache[sym]["swing_trend"] = "bullish"
+                elif today_hi < sma50:
+                    _cache[sym]["swing_trend"] = "bearish"
+                else:
+                    _cache[sym]["swing_trend"] = "mixed"
+
+                updated += 1
+            except Exception:
+                pass
+
+        _last_refresh = datetime.now()
+
+    print(f"[data] Intraday update: {updated} stocks at {_last_refresh.strftime('%H:%M:%S')}")
 
 
 def get_all() -> list[dict]:
