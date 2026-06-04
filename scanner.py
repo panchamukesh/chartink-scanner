@@ -61,16 +61,59 @@ SCAN_RULES = [
      "cond": lambda s: s["rsi"]>72 and s["changePct"]<0 and s["volume"]>s["avgVolume"]},
     {"key": "breakdown_sell",    "name": "Breakdown — Below Support",         "signal": "SELL",
      "cond": lambda s: s["close"]<s["ema50"] and s["close"]<s["ema20"] and s["changePct"]<-1.5 and s["volume"]>s["avgVolume"]},
+
+    # ── Pine Script: SWING CALLS (nicks1008) ─────────────────────────────────
+    # buycall = crossunder(sma2, ema1) and high > sma2
+    #   i.e. EMA5 just crossed ABOVE SMA50 AND high is above SMA50
+    {"key": "pine_swing_buy",
+     "name": "🔵 Swing BUY — EMA5 × SMA50 Bullish Cross",
+     "signal": "BUY",
+     "cond": lambda s: (
+         s.get("prev_sma50", 0) >= s.get("prev_ema5", 0)   # previous: SMA50 was above EMA5
+         and s.get("sma50", 0) < s.get("ema5", 0)           # now: EMA5 crossed above SMA50
+         and s["high"] > s.get("sma50", 0)                  # high is above SMA50
+     )},
+
+    # sellcall = crossover(sma2, ema1) and open > close
+    #   i.e. SMA50 just crossed ABOVE EMA5 AND bearish candle (close < open)
+    {"key": "pine_swing_sell",
+     "name": "🔴 Swing SELL — SMA50 × EMA5 Bearish Cross",
+     "signal": "SELL",
+     "cond": lambda s: (
+         s.get("prev_sma50", 0) <= s.get("prev_ema5", 0)   # previous: EMA5 was above SMA50
+         and s.get("sma50", 0) > s.get("ema5", 0)           # now: SMA50 crossed above EMA5
+         and s["changePct"] < 0                              # close < open (bearish candle)
+     )},
+
+    # sellexit = crossover(rs, ll=20) → RSI crosses above 20 = oversold reversal BUY
+    {"key": "pine_rsi_reversal_buy",
+     "name": "⬆️ Swing RSI Reversal — Oversold Exit BUY",
+     "signal": "BUY",
+     "cond": lambda s: s.get("prev_rsi", 50) <= 20 and s["rsi"] > 20},
+
+    # buyexit = crossunder(rs, hl=80) → RSI crosses under 80 = overbought reversal SELL
+    {"key": "pine_rsi_reversal_sell",
+     "name": "⬇️ Swing RSI Reversal — Overbought Exit SELL",
+     "signal": "SELL",
+     "cond": lambda s: s.get("prev_rsi", 50) >= 80 and s["rsi"] < 80},
 ]
 
 # Active rules — all enabled by default; Pine Script rules appended here later
 ACTIVE_RULES = list(SCAN_RULES)
 
-# Target/SL percentages (overridden by Pine Script rules if they define their own)
+# Target/SL percentages — default (indicator library scans)
 BUY_TARGET_PCT  =  3.0
 BUY_SL_PCT      = -1.5
 SELL_TARGET_PCT = -3.0
 SELL_SL_PCT     =  1.5
+
+# Swing trade targets (Pine Script: SWING CALLS) — wider as swing holds overnight
+SWING_BUY_TARGET_PCT  =  5.0
+SWING_BUY_SL_PCT      = -2.0
+SWING_SELL_TARGET_PCT = -5.0
+SWING_SELL_SL_PCT     =  2.0
+
+PINE_KEYS = {"pine_swing_buy", "pine_swing_sell", "pine_rsi_reversal_buy", "pine_rsi_reversal_sell"}
 
 
 def _ist_now() -> datetime:
@@ -86,14 +129,14 @@ def _is_market_open() -> bool:
     return time(10, 0) <= t <= time(15, 30)
 
 
-def _calc_targets(price, signal_type):
-    if signal_type == "BUY":
-        target = round(price * (1 + BUY_TARGET_PCT / 100), 2)
-        sl     = round(price * (1 + BUY_SL_PCT / 100), 2)
+def _calc_targets(price, signal_type, is_swing=False):
+    if is_swing:
+        tgt_pct = SWING_BUY_TARGET_PCT  if signal_type == "BUY" else SWING_SELL_TARGET_PCT
+        sl_pct  = SWING_BUY_SL_PCT      if signal_type == "BUY" else SWING_SELL_SL_PCT
     else:
-        target = round(price * (1 + SELL_TARGET_PCT / 100), 2)
-        sl     = round(price * (1 + SELL_SL_PCT / 100), 2)
-    return target, sl
+        tgt_pct = BUY_TARGET_PCT  if signal_type == "BUY" else SELL_TARGET_PCT
+        sl_pct  = BUY_SL_PCT      if signal_type == "BUY" else SELL_SL_PCT
+    return round(price * (1 + tgt_pct / 100), 2), round(price * (1 + sl_pct / 100), 2)
 
 
 def _run_scan_cycle():
@@ -116,7 +159,8 @@ def _run_scan_cycle():
                 continue
 
             price = stock["close"]
-            target, sl = _calc_targets(price, rule["signal"])
+            is_swing = rule["key"] in PINE_KEYS
+            target, sl = _calc_targets(price, rule["signal"], is_swing=is_swing)
             sig_id = _db.insert_signal(
                 symbol      = stock["symbol"],
                 name        = stock["name"],
@@ -134,10 +178,12 @@ def _run_scan_cycle():
                 sector      = stock["sector"],
                 signal_type = rule["signal"],
                 scan_name   = rule["name"],
+                scan_key    = rule["key"],
                 price       = price,
                 target      = target,
                 sl          = sl,
                 time        = _ist_now().strftime("%H:%M"),
+                swing_trend = stock.get("swing_trend", ""),
             )
             _notify.send_signal(signal)
             fired += 1

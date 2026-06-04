@@ -24,23 +24,40 @@ def _send(text):
         print(f"[notify] Telegram error: {e}")
 
 
+_PINE_KEYS = {"pine_swing_buy", "pine_swing_sell", "pine_rsi_reversal_buy", "pine_rsi_reversal_sell"}
+
+
 def send_signal(signal):
     """Send a single scan signal alert to Telegram."""
-    emoji = "🟢" if signal["signal_type"] == "BUY" else "🔴"
-    pnl_dir = "+" if signal["signal_type"] == "BUY" else "-"
-    tgt_pct = abs(round((signal["target"] - signal["price"]) / signal["price"] * 100, 1))
-    sl_pct  = abs(round((signal["sl"]     - signal["price"]) / signal["price"] * 100, 1))
+    is_buy   = signal["signal_type"] == "BUY"
+    is_swing = signal.get("scan_key", "") in _PINE_KEYS or "Swing" in signal.get("scan_name", "")
+    emoji    = "🟢" if is_buy else "🔴"
+    pnl_dir  = "+" if is_buy else "-"
+    price    = signal["price"]
+    tgt_pct  = abs(round((signal["target"] - price) / price * 100, 1)) if price else 0
+    sl_pct   = abs(round((signal["sl"]     - price) / price * 100, 1)) if price else 0
+    rr       = round(tgt_pct / sl_pct, 1) if sl_pct else "?"
+
+    # Swing trend context
+    trend = signal.get("swing_trend", "")
+    trend_str = ""
+    if trend == "bullish":
+        trend_str = "  |  📈 Trend: Bullish (price above SMA50)"
+    elif trend == "bearish":
+        trend_str = "  |  📉 Trend: Bearish (price below SMA50)"
+
+    tag = "🔄 *SWING CALL*" if is_swing else "📊 *Scan Signal*"
 
     lines = [
-        f"{emoji} *{signal['signal_type']} Signal — {signal['symbol']}*",
-        f"📊 Scan: _{signal['scan_name']}_",
-        f"🏭 Sector: {signal.get('sector','—')}",
+        f"{emoji} {tag} — *{signal['symbol']}*  [{signal['signal_type']}]",
+        f"📋 _{signal['scan_name']}_",
+        f"🏭 {signal.get('sector', '—')}{trend_str}",
         f"",
-        f"💰 Entry:  ₹{signal['price']:,.2f}",
+        f"💰 Entry:  ₹{price:,.2f}",
         f"🎯 Target: ₹{signal['target']:,.2f}  ({pnl_dir}{tgt_pct}%)",
-        f"🛑 SL:     ₹{signal['sl']:,.2f}  ({'-' if signal['signal_type']=='BUY' else '+'}{sl_pct}%)",
+        f"🛑 SL:     ₹{signal['sl']:,.2f}  ({'-' if is_buy else '+'}{sl_pct}%)",
         f"",
-        f"⏰ {signal['time']} IST  |  R:R = 1:{round(tgt_pct/sl_pct,1) if sl_pct else '?'}",
+        f"⚖️ R:R = 1:{rr}  |  ⏰ {signal['time']} IST",
     ]
     _send("\n".join(lines))
 

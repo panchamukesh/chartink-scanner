@@ -87,6 +87,7 @@ def _compute(hist: pd.DataFrame, sym_info: dict) -> dict | None:
     if close.empty:
         return None
 
+    ema5  = close.ewm(span=5,  adjust=False).mean()
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
     sma20 = close.rolling(20).mean()
@@ -103,25 +104,47 @@ def _compute(hist: pd.DataFrame, sym_info: dict) -> dict | None:
     # Delivery estimate: higher on strong up days
     delivery = min(85, max(20, 50 + change_pct * 4))
 
+    rsi_val      = round(float(rsi.iloc[-1]),  1) if not math.isnan(rsi.iloc[-1])  else 50.0
+    rsi_prev     = round(float(rsi.iloc[-2]),  1) if len(rsi) > 1 and not math.isnan(rsi.iloc[-2]) else rsi_val
+    ema5_val     = round(float(ema5.iloc[-1]), 2)
+    ema5_prev    = round(float(ema5.iloc[-2]), 2) if len(ema5) > 1 else ema5_val
+    sma50_val    = round(float(sma50.iloc[-1]), 2)
+    sma50_prev   = round(float(sma50.iloc[-2]), 2) if len(sma50) > 1 else sma50_val
+
+    # Swing trend colour (mirrors Pine Script mycolor logic)
+    low_val  = round(float(latest["Low"]),  2)
+    high_val = round(float(latest["High"]), 2)
+    if low_val > sma50_val:
+        swing_trend = "bullish"
+    elif high_val < sma50_val:
+        swing_trend = "bearish"
+    else:
+        swing_trend = "mixed"
+
     return {
-        "symbol":     sym_info["symbol"],
-        "name":       sym_info["name"],
-        "sector":     sym_info["sector"],
-        "close":      round(float(latest["Close"]), 2),
-        "open":       round(float(latest["Open"]),  2),
-        "high":       round(float(latest["High"]),  2),
-        "low":        round(float(latest["Low"]),   2),
-        "changePct":  change_pct,
-        "volume":     int(latest["Volume"]),
-        "avgVolume":  avg_vol,
-        "rsi":        round(float(rsi.iloc[-1]), 1) if not math.isnan(rsi.iloc[-1]) else 50.0,
-        "ema20":      round(float(ema20.iloc[-1]), 2),
-        "ema50":      round(float(ema50.iloc[-1]), 2),
-        "sma20":      round(float(sma20.iloc[-1]), 2),
-        "sma50":      round(float(sma50.iloc[-1]), 2),
-        "resistance": round(float(hist["High"].tail(260).max()), 2),   # ~1-year high
-        "delivery":   round(delivery, 1),
-        "pe":         0,
+        "symbol":      sym_info["symbol"],
+        "name":        sym_info["name"],
+        "sector":      sym_info["sector"],
+        "close":       round(float(latest["Close"]), 2),
+        "open":        round(float(latest["Open"]),  2),
+        "high":        high_val,
+        "low":         low_val,
+        "changePct":   change_pct,
+        "volume":      int(latest["Volume"]),
+        "avgVolume":   avg_vol,
+        "rsi":         rsi_val,
+        "prev_rsi":    rsi_prev,
+        "ema5":        ema5_val,
+        "prev_ema5":   ema5_prev,
+        "ema20":       round(float(ema20.iloc[-1]), 2),
+        "ema50":       round(float(ema50.iloc[-1]), 2),
+        "sma20":       round(float(sma20.iloc[-1]), 2),
+        "sma50":       sma50_val,
+        "prev_sma50":  sma50_prev,
+        "resistance":  round(float(hist["High"].tail(260).max()), 2),
+        "delivery":    round(delivery, 1),
+        "pe":          0,
+        "swing_trend": swing_trend,
     }
 
 
