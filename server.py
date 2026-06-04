@@ -211,7 +211,7 @@ def test_scan():
     # 1 — fetch live 5m data
     print("[test-scan] Fetching 5m bars …")
     try:
-        _data.refresh_5m()
+        _data.smart_refresh()
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

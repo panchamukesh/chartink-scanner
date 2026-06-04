@@ -66,32 +66,52 @@ def _relogin():
 
 
 # ─── Instrument token map ─────────────────────────────────────────────────────
+# Known NSE equity tokens (fallback if scrip master lookup misses them)
+_KNOWN_TOKENS = {
+    "RELIANCE": "2885",  "TCS": "11536",    "HDFCBANK": "1333",
+    "INFY": "1594",      "ICICIBANK": "4963","SBIN": "3045",
+    "LT": "11483",       "AXISBANK": "5900", "MARUTI": "10999",
+    "TATAMOTORS": "3456","SUNPHARMA": "3351","CIPLA": "694",
+    "ASIANPAINT": "236", "HINDUNILVR": "1394","NTPC": "11630",
+    "POWERGRID": "14977","TITAN": "3506",    "BAJFINANCE": "317",
+    "ADANIENT": "25",    "JSWSTEEL": "11723","ULTRACEMCO": "2770",
+    "GRASIM": "1232",    "WIPRO": "3787",    "HCLTECH": "7229",
+    "TECHM": "13538",    "BAJAJFINSV": "16675","KOTAKBANK": "1922",
+    "INDUSINDBK": "5258","DRREDDY": "881",   "ONGC": "2475",
+    "IOC": "1624",       "COALINDIA": "20374","TATASTEEL": "3499",
+    "HINDALCO": "1363",  "BHARTIARTL": "10604","ITC": "1660",
+    "HEROMOTOCO": "1348","EICHERMOT": "910", "DIVISLAB": "10940",
+    "PIDILITIND": "2664","AMBUJACEM": "1270","UPL": "11287",
+    "BRITANNIA": "547",  "IEX": "23650",     "IRCTC": "542358",
+}
+
+
 def build_token_map(universe: list) -> bool:
     """
     Download Angel One scrip master and map our stock symbols to tokens.
-    Called once at startup.
+    Falls back to hardcoded known tokens for any that are missing.
     """
     global _token_map
     needed = {s["symbol"] for s in universe}
+    tmap   = dict(_KNOWN_TOKENS)   # start with known tokens
+
     try:
         url  = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         data = requests.get(url, timeout=30).json()
-        tmap = {}
         for item in data:
             if item.get("exch_seg") != "NSE":
                 continue
-            # Angel One symbol format: "RELIANCE-EQ" or "RELIANCE"
             sym = item.get("symbol", "").replace("-EQ", "").strip()
             if sym in needed:
-                tmap[sym] = str(item["token"])
-        _token_map = tmap
-        missing = needed - set(tmap.keys())
-        print(f"[angel] Token map: {len(tmap)}/{len(needed)} symbols "
-              f"{'| missing: ' + str(missing) if missing else '✅'}")
-        return True
+                tmap[sym] = str(item["token"])   # scrip master overrides hardcoded
     except Exception as e:
-        print(f"[angel] Token map error: {e}")
-        return False
+        print(f"[angel] Scrip master download failed ({e}) — using hardcoded tokens")
+
+    _token_map = {k: v for k, v in tmap.items() if k in needed}
+    missing    = needed - set(_token_map.keys())
+    print(f"[angel] Token map: {len(_token_map)}/{len(needed)} symbols "
+          f"{'| missing: ' + str(missing) if missing else '✅ all mapped'}")
+    return True
 
 
 # ─── Candle fetch ─────────────────────────────────────────────────────────────

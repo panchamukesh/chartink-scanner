@@ -265,7 +265,7 @@ def _loop():
         if _is_market_open() and not opened_today:
             print("[scanner] 🔔 Market open — loading 5-min bars for all 45 stocks …")
             try:
-                _data.refresh_5m()
+                _data.smart_refresh()
                 opened_today = True
                 print("[scanner] ✅ 5m data ready — scanning every 60 seconds on 5-min timeframe")
             except Exception as e:
@@ -275,7 +275,7 @@ def _loop():
         if _is_market_open() and opened_today:
             if last_scan is None or (now - last_scan).seconds >= 60:
                 try:
-                    _data.refresh_5m()      # fetch latest completed 5-min bar
+                    _data.smart_refresh()      # fetch latest completed 5-min bar
                 except Exception as e:
                     print(f"[scanner] 5m refresh error: {e}")
                 try:

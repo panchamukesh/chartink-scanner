@@ -27,7 +27,7 @@ UNIVERSE = [
     {"symbol": "LT",         "name": "Larsen & Toubro",           "sector": "Capital Goods"},
     {"symbol": "AXISBANK",   "name": "Axis Bank",                 "sector": "Banking"},
     {"symbol": "MARUTI",     "name": "Maruti Suzuki",             "sector": "Auto"},
-    {"symbol": "TATAMOTORS", "name": "Tata Motors",               "sector": "Auto",    "yf": "TATAMOTORS.BO"},
+    {"symbol": "TATAMOTORS", "name": "Tata Motors",               "sector": "Auto"},
     {"symbol": "SUNPHARMA",  "name": "Sun Pharmaceutical",        "sector": "Pharma"},
     {"symbol": "CIPLA",      "name": "Cipla",                     "sector": "Pharma"},
     {"symbol": "ASIANPAINT", "name": "Asian Paints",              "sector": "Consumer"},
