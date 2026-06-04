@@ -63,47 +63,69 @@ def send_signal(signal):
 
 
 def send_eod_report(signals):
-    """Send consolidated end-of-day report."""
-    if not signals:
-        _send("📋 *MarketScan Pro — EOD Report*\nNo signals fired today.")
-        return
-
+    """
+    Send consolidated end-of-day report.
+    Splits into multiple Telegram messages if content exceeds 4096 chars.
+    """
     from datetime import datetime
     date_str = datetime.now().strftime("%d %b %Y")
 
-    total = len(signals)
-    hits  = sum(1 for s in signals if s.get("target_hit"))
-    stops = sum(1 for s in signals if s.get("sl_hit"))
-    open_ = total - hits - stops
+    if not signals:
+        _send(f"📋 *MarketScan Pro — EOD Report*\n📅 {date_str}\n\nNo signals fired today.")
+        return
 
+    total    = len(signals)
+    hits     = sum(1 for s in signals if s.get("target_hit"))
+    stops    = sum(1 for s in signals if s.get("sl_hit"))
+    open_    = total - hits - stops
     win_rate = round(hits / total * 100) if total else 0
-    pnls = [s["pnl_pct"] for s in signals if s.get("pnl_pct") is not None]
-    avg_pnl = round(sum(pnls) / len(pnls), 2) if pnls else 0
+    pnls     = [s["pnl_pct"] for s in signals if s.get("pnl_pct") is not None]
+    avg_pnl  = round(sum(pnls) / len(pnls), 2) if pnls else 0
 
-    lines = [
+    # ── Part 1: Summary header (always one message) ───────────────────────────
+    header = "\n".join([
         f"📋 *MarketScan Pro — EOD Report*",
         f"📅 {date_str}",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"Total: *{total}*  |  ✅ {hits}  |  ❌ {stops}  |  ⏳ {open_}",
-        f"Win Rate: *{win_rate}%*  |  Avg P&L: *{'+' if avg_pnl>=0 else ''}{avg_pnl}%*",
+        f"📊 Total Signals: *{total}*",
+        f"✅ Target Hit: *{hits}*   ❌ SL Hit: *{stops}*   ⏳ Open: *{open_}*",
+        f"🏆 Win Rate: *{win_rate}%*   📈 Avg P&L: *{'+' if avg_pnl>=0 else ''}{avg_pnl}%*",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
+    ])
+    _send(header)
+
+    # ── Part 2+: Signal rows, chunked to stay under 4096 chars ───────────────
+    CHUNK_LIMIT = 3800   # safe buffer below Telegram's 4096
+
+    chunk_lines = []
+    chunk_len   = 0
 
     for s in signals:
         eod = s.get("eod_price")
         pnl = s.get("pnl_pct")
-        if s.get("target_hit"):
-            status = "✅ TARGET HIT"
-        elif s.get("sl_hit"):
-            status = "❌ SL HIT"
-        else:
-            status = "⏳ Pending"
 
-        eod_str = f"₹{eod:,.2f}  ({'+' if pnl>=0 else ''}{pnl}%)" if eod else "—"
-        lines.append(
-            f"*{s['symbol']}* [{s['signal_type']}] @₹{s['price']:,.2f} "
-            f"→ EOD: {eod_str} — {status}"
+        if s.get("target_hit"):
+            status = "✅ HIT"
+        elif s.get("sl_hit"):
+            status = "❌ SL"
+        else:
+            status = "⏳"
+
+        eod_str = f"EOD ₹{eod:,.0f} ({'+' if pnl and pnl>=0 else ''}{pnl if pnl else 0:.1f}%)" if eod else "EOD —"
+        line = (
+            f"{'🟢' if s['signal_type']=='BUY' else '🔴'} *{s['symbol']}* "
+            f"[{s['signal_type']}] @₹{s['price']:,.0f} | "
+            f"T:₹{s['target']:,.0f} SL:₹{s['sl']:,.0f} | "
+            f"{eod_str} {status} | {s['time']}"
         )
 
-    _send("\n".join(lines))
+        if chunk_len + len(line) + 1 > CHUNK_LIMIT:
+            _send("\n".join(chunk_lines))
+            chunk_lines = []
+            chunk_len   = 0
+
+        chunk_lines.append(line)
+        chunk_len += len(line) + 1
+
+    if chunk_lines:
+        _send("\n".join(chunk_lines))
