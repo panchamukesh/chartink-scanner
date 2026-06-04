@@ -27,7 +27,7 @@ UNIVERSE = [
     {"symbol": "LT",         "name": "Larsen & Toubro",           "sector": "Capital Goods"},
     {"symbol": "AXISBANK",   "name": "Axis Bank",                 "sector": "Banking"},
     {"symbol": "MARUTI",     "name": "Maruti Suzuki",             "sector": "Auto"},
-    {"symbol": "TATAMOTORS", "name": "Tata Motors",               "sector": "Auto"},
+    {"symbol": "TATAMOTORS", "name": "Tata Motors",               "sector": "Auto",    "yf": "TATAMOTORS.BO"},
     {"symbol": "SUNPHARMA",  "name": "Sun Pharmaceutical",        "sector": "Pharma"},
     {"symbol": "CIPLA",      "name": "Cipla",                     "sector": "Pharma"},
     {"symbol": "ASIANPAINT", "name": "Asian Paints",              "sector": "Consumer"},
@@ -191,7 +191,7 @@ def refresh_5m():
     Called both at market open and every 60 seconds intraday.
     """
     global _last_refresh
-    yf_symbols = [s["symbol"] + YF_SUFFIX for s in UNIVERSE]
+    yf_symbols = [s.get("yf", s["symbol"] + YF_SUFFIX) for s in UNIVERSE]
 
     try:
         raw = yf.download(
@@ -209,7 +209,7 @@ def refresh_5m():
 
     updated = {}
     for sym_info in UNIVERSE:
-        yf_sym = sym_info["symbol"] + YF_SUFFIX
+        yf_sym = sym_info.get("yf", sym_info["symbol"] + YF_SUFFIX)
         try:
             hist = raw[yf_sym] if len(yf_symbols) > 1 else raw
             if hist is None or hist.empty:
