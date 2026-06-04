@@ -63,6 +63,141 @@ def trigger_eod():
     return jsonify({"ok": True, "msg": "EOD report triggered"})
 
 
+@app.route("/webhook/tradingview", methods=["POST"])
+def tradingview_webhook():
+    """
+    Receives real-time alerts directly from TradingView Pine Script.
+    TradingView POSTs the alert message as JSON body.
+
+    Expected message format (set this in TradingView alert message box):
+    {
+      "symbol":   "{{ticker}}",
+      "signal":   "BUY",
+      "price":    {{close}},
+      "high":     {{high}},
+      "low":      {{low}},
+      "volume":   {{volume}},
+      "scan":     "Swing BUY — EMA5 x SMA50",
+      "tf":       "{{interval}}",
+      "time":     "{{timenow}}"
+    }
+    """
+    import data as _data
+    import notify as _notify
+
+    # ── Parse payload ─────────────────────────────────────────────────────────
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        if not payload:
+            raw = request.data.decode("utf-8", errors="ignore").strip()
+            import json
+            payload = json.loads(raw)
+    except Exception as e:
+        print(f"[webhook] Parse error: {e} | raw: {request.data[:200]}")
+        return jsonify({"ok": False, "error": "bad payload"}), 400
+
+    symbol      = str(payload.get("symbol", "")).upper().replace(".NS", "").replace("NSE:", "")
+    signal_type = str(payload.get("signal", "BUY")).upper()
+    scan_name   = str(payload.get("scan",   "TradingView Signal"))
+    tf          = str(payload.get("tf",     "5m"))
+
+    try:
+        price = float(payload.get("price", 0))
+    except Exception:
+        price = 0.0
+
+    if not symbol or price <= 0:
+        return jsonify({"ok": False, "error": "missing symbol or price"}), 400
+
+    # ── Targets ───────────────────────────────────────────────────────────────
+    is_swing = True   # TradingView signals treated as swing calls
+    target, sl = scanner._calc_targets(price, signal_type, is_swing=is_swing)
+
+    # ── Find stock meta (name / sector) from universe ─────────────────────────
+    meta = next((s for s in _data.UNIVERSE if s["symbol"] == symbol), None)
+    name   = meta["name"]   if meta else symbol
+    sector = meta["sector"] if meta else "—"
+
+    # ── Save to DB ────────────────────────────────────────────────────────────
+    sig_id = db.insert_signal(
+        symbol      = symbol,
+        name        = name,
+        sector      = sector,
+        signal_type = signal_type,
+        scan_name   = f"📡 {scan_name}",
+        price       = price,
+        target      = target,
+        sl          = sl,
+    )
+
+    # ── Send Telegram immediately ─────────────────────────────────────────────
+    sig = dict(
+        id          = sig_id,
+        symbol      = symbol,
+        name        = name,
+        sector      = sector,
+        signal_type = signal_type,
+        scan_name   = f"📡 {scan_name}",
+        scan_key    = "tradingview",
+        price       = price,
+        target      = target,
+        sl          = sl,
+        time        = datetime.now(_IST).strftime("%H:%M"),
+        swing_trend = "",
+    )
+    _notify.send_signal(sig)
+
+    print(f"[webhook] 📡 LIVE {signal_type} {symbol} @{price} via TradingView")
+    return jsonify({"ok": True, "symbol": symbol, "signal": signal_type, "id": sig_id})
+
+
+@app.route("/webhook/test", methods=["POST"])
+def webhook_test():
+    """Send a fake TradingView webhook to verify the pipeline works."""
+    import notify as _notify
+    import data as _data
+
+    test_payload = {
+        "symbol": "RELIANCE",
+        "signal": "BUY",
+        "price": 2937.50,
+        "high": 2950.00,
+        "low": 2920.00,
+        "volume": 8200000,
+        "scan": "Swing BUY — EMA5 x SMA50 [LIVE TEST]",
+        "tf": "5m",
+        "time": datetime.now(_IST).strftime("%Y-%m-%d %H:%M"),
+    }
+
+    # Reuse the main webhook handler logic
+    with app.test_request_context(
+        "/webhook/tradingview",
+        method="POST",
+        json=test_payload,
+        content_type="application/json",
+    ):
+        from flask import request as _req
+        import json
+        payload  = test_payload
+        symbol   = payload["symbol"]
+        signal_type = payload["signal"]
+        price    = float(payload["price"])
+        scan_name = payload["scan"]
+        meta     = next((s for s in _data.UNIVERSE if s["symbol"] == symbol), None)
+        name     = meta["name"]   if meta else symbol
+        sector   = meta["sector"] if meta else "—"
+        target, sl = scanner._calc_targets(price, signal_type, is_swing=True)
+        sig_id   = db.insert_signal(symbol, name, sector, signal_type, f"📡 {scan_name}", price, target, sl)
+        sig      = dict(id=sig_id, symbol=symbol, name=name, sector=sector,
+                        signal_type=signal_type, scan_name=f"📡 {scan_name}",
+                        scan_key="tradingview", price=price, target=target, sl=sl,
+                        time=datetime.now(_IST).strftime("%H:%M"), swing_trend="")
+        _notify.send_signal(sig)
+
+    print("[webhook] ✅ Test webhook fired")
+    return jsonify({"ok": True, "msg": "Test signal sent to Telegram", "payload": test_payload})
+
+
 @app.route("/api/scan/test", methods=["POST"])
 def test_scan():
     """
