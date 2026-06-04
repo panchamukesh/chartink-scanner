@@ -301,6 +301,20 @@ def _loop():
 def start():
     """Start the background scanner thread (call once at app startup)."""
     _db.init_db()
+
+    # Initialise Angel One real-time data source
+    try:
+        import angel_data as _angel
+        import data as _data_mod
+        print("[scanner] Connecting to Angel One SmartAPI …")
+        if _angel.login():
+            _angel.build_token_map(_data_mod.UNIVERSE)
+            print("[scanner] ✅ Angel One ready — real-time NSE data active")
+        else:
+            print("[scanner] ⚠️  Angel One login failed — will use Yahoo Finance (delayed)")
+    except Exception as e:
+        print(f"[scanner] Angel One init error: {e} — falling back to Yahoo Finance")
+
     t = threading.Thread(target=_loop, daemon=True, name="scanner")
     t.start()
-    print("[scanner] Started")
+    print("[scanner] Auto-scanner started")

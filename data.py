@@ -183,7 +183,28 @@ def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
     }
 
 
-# ─── Main refresh (runs every 60 s during market hours) ──────────────────────
+# ─── Angel One primary refresh ───────────────────────────────────────────────
+def _try_angel_refresh() -> bool:
+    """Try to refresh using Angel One real-time data. Returns True on success."""
+    try:
+        import angel_data as _angel
+        if not _angel.is_ready():
+            return False
+        results = _angel.refresh_universe(UNIVERSE)
+        if not results:
+            return False
+        with _cache_lock:
+            _cache.update(results)
+        global _last_refresh
+        _last_refresh = datetime.now()
+        print(f"[data] ✅ Angel One: {len(results)} stocks refreshed (real-time)")
+        return True
+    except Exception as e:
+        print(f"[data] Angel One refresh error: {e}")
+        return False
+
+
+# ─── Yahoo Finance fallback refresh ──────────────────────────────────────────
 def refresh_5m():
     """
     Download 10 days of 5-minute bars for all universe symbols.
@@ -228,12 +249,23 @@ def refresh_5m():
           f"@ {_last_refresh.strftime('%H:%M:%S')} IST")
 
 
-# Keep old name as alias so server.py status endpoint still works
-def refresh_all():
+def smart_refresh():
+    """
+    Primary: Angel One real-time 5m data (no delay).
+    Fallback: Yahoo Finance 5m data (~15 min delayed) if Angel One unavailable.
+    """
+    if _try_angel_refresh():
+        return   # Angel One succeeded — real-time data
+    print("[data] Angel One unavailable — falling back to Yahoo Finance (delayed)")
     refresh_5m()
 
+
+# Aliases
+def refresh_all():
+    smart_refresh()
+
 def refresh_intraday():
-    refresh_5m()
+    smart_refresh()
 
 
 # ─── Accessors ────────────────────────────────────────────────────────────────
