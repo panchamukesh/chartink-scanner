@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MarketScan Pro</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">MS</div>
+          <div>
+            <h1>MarketScan Pro</h1>
+            <p>NSE scanner workspace</p>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Primary">
+          <button class="nav-item active" data-view="dashboard">Dashboard</button>
+          <button class="nav-item" data-view="scanner">Scanner</button>
+          <button class="nav-item" data-view="saved">Saved Scans</button>
+          <button class="nav-item" data-view="alerts">Alerts</button>
+          <button class="nav-item" data-view="watchlist">Watchlist</button>
+        </nav>
+
+        <div class="scan-presets">
+          <h2>Popular Scans</h2>
+          <button data-preset="breakout">Price Volume Breakout</button>
+          <button data-preset="rsi">RSI Recovery</button>
+          <button data-preset="delivery">Delivery Strength</button>
+          <button data-preset="maCross">EMA Bull Cross</button>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Live-style market scanner</p>
+            <h2 id="pageTitle">Dashboard</h2>
+          </div>
+          <div class="top-actions">
+            <label class="file-button">
+              Import Pine
+              <input id="pineInput" type="file" accept=".pine,.txt,.pinescript" />
+            </label>
+            <label class="file-button">
+              Import CSV
+              <input id="csvInput" type="file" accept=".csv" />
+            </label>
+            <button id="exportResults">Export Results</button>
+            <button id="refreshData">Refresh Prices</button>
+            <button id="openTelegramSettings" class="tg-btn" title="Configure Telegram scan alerts">📲 Telegram</button>
+          </div>
+        </header>
+
+        <section id="dashboard" class="view active">
+          <div class="stats-grid">
+            <article>
+              <span>Universe</span>
+              <strong id="statUniverse">0</strong>
+              <small>NSE equities tracked</small>
+            </article>
+            <article>
+              <span>Advances</span>
+              <strong id="statAdvances">0</strong>
+              <small>Stocks trading higher</small>
+            </article>
+            <article>
+              <span>Breakouts</span>
+              <strong id="statBreakouts">0</strong>
+              <small>Above prior resistance</small>
+            </article>
+            <article>
+              <span>Triggered Alerts</span>
+              <strong id="statAlerts">0</strong>
+              <small>Matching saved rules</small>
+            </article>
+          </div>
+
+          <section class="market-layout">
+            <div class="panel">
+              <div class="panel-head">
+                <h3>Market Breadth</h3>
+                <select id="sectorFilter" aria-label="Sector filter">
+                  <option value="all">All sectors</option>
+                </select>
+              </div>
+              <div id="breadthBars" class="breadth-bars"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h3>Top Movers</h3>
+                <div class="segmented">
+                  <button class="active" data-mover="gainers">Gainers</button>
+                  <button data-mover="losers">Losers</button>
+                </div>
+              </div>
+              <div id="moversList" class="movers-list"></div>
+            </div>
+          </section>
+        </section>
+
+        <section id="scanner" class="view">
+          <div class="scanner-grid">
+            <section class="panel builder-panel">
+
+              <!-- Indicator Library -->
+              <div class="indicator-library">
+                <div class="indicator-library-head">
+                  <span class="indicator-library-label">⚡ Indicator Library</span>
+                  <span class="indicator-library-sub">Top 20 indicators used by pro traders</span>
+                </div>
+                <div class="indicator-pick-row">
+                  <select id="indicatorSelect">
+                    <option value="">— Select an indicator to auto-fill scanner —</option>
+                  </select>
+                  <button id="applyIndicatorBtn">Apply</button>
+                </div>
+                <p id="indicatorDesc" class="indicator-desc"></p>
+              </div>
+
+              <div class="panel-head" style="margin-top:14px">
+                <h3>Scan Builder</h3>
+                <div class="segmented">
+                  <button class="active" data-mode="visual">Visual</button>
+                  <button data-mode="formula">Formula</button>
+                </div>
+              </div>
+
+              <div id="visualBuilder" class="builder-mode active">
+                <div id="conditionList" class="condition-list"></div>
+                <button id="addCondition" class="secondary">Add Condition</button>
+              </div>
+
+              <div id="formulaBuilder" class="builder-mode">
+                <textarea id="formulaInput" spellcheck="false"></textarea>
+                <p class="hint">Use fields like close, volume, rsi, delivery, sector. Operators: &gt;, &lt;, =, contains, and, or.</p>
+              </div>
+
+              <div id="pineImportPanel" class="pine-import-panel">
+                <div class="mini-head">
+                  <strong>Pine Script Converter</strong>
+                  <span id="pineStatus">No script imported</span>
+                </div>
+                <textarea id="pinePreview" spellcheck="false" placeholder="Upload Pine Script or paste it here, then convert."></textarea>
+                <div class="pine-actions">
+                  <button id="convertPine" class="secondary">Convert Pine</button>
+                  <button id="applyPineFormula">Apply Formula</button>
+                </div>
+                <div id="pineSummary" class="pine-summary"></div>
+              </div>
+
+              <div class="builder-actions">
+                <input id="scanName" type="text" placeholder="Scan name" />
+                <button id="runScan">Run Scan</button>
+                <button id="saveScan">Save</button>
+              </div>
+            </section>
+
+            <section class="panel chart-panel">
+              <div class="panel-head">
+                <h3 id="chartTitle">Select a stock</h3>
+                <button id="addToWatchlist" class="secondary">Watch</button>
+              </div>
+              <canvas id="priceChart" width="760" height="320"></canvas>
+              <div id="stockSnapshot" class="stock-snapshot"></div>
+            </section>
+          </div>
+
+          <section class="panel results-panel">
+            <div class="panel-head">
+              <div>
+                <h3>Scan Results</h3>
+                <p id="recommendationSummary" class="hint">Run a scan to rank recommendations.</p>
+              </div>
+              <input id="resultSearch" type="search" placeholder="Search symbol or name" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th data-sort="symbol">Symbol</th>
+                    <th data-sort="name">Name</th>
+                    <th data-sort="sector">Sector</th>
+                    <th data-sort="close">Close</th>
+                    <th data-sort="changePct">Change %</th>
+                    <th data-sort="volume">Volume</th>
+                    <th data-sort="rsi">RSI</th>
+                    <th data-sort="delivery">Delivery %</th>
+                    <th>Signal</th>
+                  </tr>
+                </thead>
+                <tbody id="resultsBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="saved" class="view">
+          <section class="panel">
+            <div class="panel-head">
+              <h3>Saved Scans</h3>
+              <button id="clearSaved" class="secondary">Clear</button>
+            </div>
+            <div id="savedScans" class="saved-list"></div>
+          </section>
+        </section>
+
+        <section id="alerts" class="view">
+          <section class="panel">
+            <div class="panel-head">
+              <h3>Alerts</h3>
+              <button id="enableNotifications" class="secondary">Browser Notifications</button>
+            </div>
+            <div id="alertsList" class="alerts-list"></div>
+          </section>
+        </section>
+
+        <section id="watchlist" class="view">
+          <section class="panel">
+            <div class="panel-head">
+              <h3>Watchlist</h3>
+              <button id="clearWatchlist" class="secondary">Clear</button>
+            </div>
+            <div id="watchlistGrid" class="watchlist-grid"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <!-- Telegram Settings Modal -->
+    <div id="telegramModal" class="modal-overlay">
+      <div class="modal-box">
+        <div class="modal-head">
+          <h3>📲 Telegram Alerts</h3>
+          <button id="closeTelegramModal" class="icon-button">&times;</button>
+        </div>
+        <p class="hint" style="margin-bottom:16px">Sends a Telegram message whenever a scan finds matching stocks.</p>
+
+        <label class="field-label">Bot Token</label>
+        <input id="tgToken" type="text" placeholder="1234567890:AAF..." autocomplete="off" />
+
+        <label class="field-label" style="margin-top:12px">Chat ID / Channel Username</label>
+        <input id="tgChatId" type="text" placeholder="@yourchannel or numeric ID" autocomplete="off" />
+
+        <label class="toggle-row" style="margin-top:14px">
+          <input id="tgEnabled" type="checkbox" checked />
+          <span>Send alert when scan returns matches</span>
+        </label>
+
+        <div class="modal-actions">
+          <button id="saveTelegramBtn">Save Settings</button>
+          <button id="testTelegramBtn" class="secondary">Test Message</button>
+        </div>
+        <p id="tgStatus" class="hint" style="margin-top:10px;min-height:18px"></p>
+      </div>
+    </div>
+
+    <template id="conditionTemplate">
+      <div class="condition-row">
+        <select class="field"></select>
+        <select class="operator">
+          <option value=">">greater than</option>
+          <option value="<">less than</option>
+          <option value=">=">at least</option>
+          <option value="<=">at most</option>
+          <option value="=">equals</option>
+          <option value="contains">contains</option>
+        </select>
+        <input class="value" type="text" />
+        <button class="icon-button remove" title="Remove condition">&times;</button>
+      </div>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
