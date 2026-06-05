@@ -304,9 +304,12 @@ def _loop():
             except Exception as e:
                 print(f"[scanner] 5m load error: {e}")
 
-        # ── Every 60 seconds: refresh 5m bars + run scan ──────────────────────
+        # ── Every 2 minutes: refresh 5m bars + run scan ───────────────────────
+        # Angel One historical API: ~1.1s/stock × 45 stocks = ~50s fetch time.
+        # 120s cycle gives a comfortable buffer. Signals still fire within
+        # 2 minutes of a 5m candle closing — accurate enough for swing calls.
         if _is_market_open() and opened_today:
-            if last_scan is None or (now - last_scan).seconds >= 60:
+            if last_scan is None or (now - last_scan).seconds >= 120:
                 try:
                     _data.smart_refresh()      # fetch latest completed 5-min bar
                 except Exception as e:

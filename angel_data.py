@@ -260,14 +260,17 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
 def refresh_universe(universe: list) -> dict:
     """
     Fetch 5m candles for all symbols, compute indicators.
-    Returns dict: symbol → stock dict.
-    Rate-limit safe: 0.35s between calls → ~16s for 45 stocks.
+    Rate limit: Angel One allows ~1 req/sec on historical API.
+    Sleep 1.1s between calls → ~50s for 45 stocks (fits in 60s scan window).
+    Retries once on rate-limit errors.
     """
     if _obj is None:
         print("[angel] Not logged in")
         return {}
 
-    results = {}
+    results   = {}
+    retries   = []   # symbols that hit rate limit — retry at end
+
     for i, sym_info in enumerate(universe):
         sym     = sym_info["symbol"]
         candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
@@ -275,8 +278,24 @@ def refresh_universe(universe: list) -> dict:
             stock = _compute(candles, sym_info)
             if stock:
                 results[sym] = stock
+        else:
+            retries.append(sym_info)   # may have hit rate limit
+
         if i < len(universe) - 1:
-            time.sleep(0.35)   # stay within rate limit
+            time.sleep(1.1)   # 1.1s gap — safely within Angel One rate limit
+
+    # Retry failed symbols with extra delay
+    if retries:
+        print(f"[angel] Retrying {len(retries)} symbols after rate-limit pause …")
+        time.sleep(5)
+        for sym_info in retries:
+            sym     = sym_info["symbol"]
+            candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
+            if candles:
+                stock = _compute(candles, sym_info)
+                if stock:
+                    results[sym] = stock
+            time.sleep(1.5)
 
     print(f"[angel] Refreshed {len(results)}/{len(universe)} symbols "
           f"@ {datetime.now(_IST).strftime('%H:%M:%S')} IST")
