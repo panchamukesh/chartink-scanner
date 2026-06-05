@@ -38,6 +38,15 @@ def init_db():
         c.commit()
 
 
+def count_today() -> int:
+    """Total signals fired today (for daily cap check)."""
+    date = datetime.now().strftime("%Y-%m-%d")
+    with _conn() as c:
+        return c.execute(
+            "SELECT COUNT(*) FROM signals WHERE date=?", (date,)
+        ).fetchone()[0]
+
+
 def already_signaled(symbol, scan_name=None, cooldown_min=120):
     """
     Per-STOCK cooldown (not per scan).

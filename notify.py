@@ -24,42 +24,38 @@ def _send(text):
         print(f"[notify] Telegram error: {e}")
 
 
-_PINE_KEYS = {"pine_swing_buy", "pine_swing_sell", "pine_rsi_reversal_buy", "pine_rsi_reversal_sell"}
-
-
 def send_signal(signal):
-    """Send a single scan signal alert to Telegram."""
-    is_buy   = signal["signal_type"] == "BUY"
-    is_swing = signal.get("scan_key", "") in _PINE_KEYS or "Swing" in signal.get("scan_name", "")
-    emoji    = "🟢" if is_buy else "🔴"
-    pnl_dir  = "+" if is_buy else "-"
-    price    = signal["price"]
-    tgt_pct  = abs(round((signal["target"] - price) / price * 100, 1)) if price else 0
-    sl_pct   = abs(round((signal["sl"]     - price) / price * 100, 1)) if price else 0
-    rr       = round(tgt_pct / sl_pct, 1) if sl_pct else "?"
+    """Send a quality-filtered signal alert to Telegram."""
+    is_buy  = signal["signal_type"] == "BUY"
+    emoji   = "🟢" if is_buy else "🔴"
+    price   = signal["price"]
+    target  = signal["target"]
+    sl      = signal["sl"]
 
-    # Swing trend context
-    trend = signal.get("swing_trend", "")
-    trend_str = ""
-    if trend == "bullish":
-        trend_str = "  |  📈 Trend: Bullish (price above SMA50)"
-    elif trend == "bearish":
-        trend_str = "  |  📉 Trend: Bearish (price below SMA50)"
+    tgt_pct = round(abs(target - price) / price * 100, 1) if price else 0
+    sl_pct  = round(abs(price  - sl)    / price * 100, 1) if price else 0
+    rr      = signal.get("rr") or (round(tgt_pct / sl_pct, 1) if sl_pct else "?")
 
-    tag        = "🔄 *SWING CALL*" if is_swing else "📊 *Scan Signal*"
-    match_count = signal.get("match_count", 1)
-    strength   = f"  |  💪 {match_count} scans confirm" if match_count > 1 else ""
+    atr         = signal.get("atr", 0)
+    atr_str     = f"  |  ATR ₹{atr:.1f}" if atr else ""
+    nifty_trend = signal.get("nifty_trend", "")
+    nifty_str   = "📈 Nifty Bullish" if nifty_trend == "bullish" else "📉 Nifty Bearish"
+    rsi         = signal.get("rsi", 0)
+    vol         = signal.get("volume", 0)
+    avg_vol     = signal.get("avg_volume", 0)
+    vol_x       = round(vol / avg_vol, 1) if avg_vol else 0
 
     lines = [
-        f"{emoji} {tag} — *{signal['symbol']}*  [{signal['signal_type']}]",
+        f"{emoji} *{'SWING BUY' if is_buy else 'SWING SELL'} — {signal['symbol']}*",
         f"📋 _{signal['scan_name']}_",
-        f"🏭 {signal.get('sector', '—')}{trend_str}{strength}",
+        f"🏭 {signal.get('sector','—')}  |  {nifty_str}",
         f"",
-        f"💰 Entry:  ₹{price:,.2f}",
-        f"🎯 Target: ₹{signal['target']:,.2f}  ({pnl_dir}{tgt_pct}%)",
-        f"🛑 SL:     ₹{signal['sl']:,.2f}  ({'-' if is_buy else '+'}{sl_pct}%)",
+        f"💰 *Entry:*  ₹{price:,.2f}",
+        f"🎯 *Target:* ₹{target:,.2f}  ({'+' if is_buy else '-'}{tgt_pct}%)",
+        f"🛑 *SL:*     ₹{sl:,.2f}  ({'-' if is_buy else '+'}{sl_pct}%){atr_str}",
         f"",
-        f"⚖️ R:R = 1:{rr}  |  ⏰ {signal['time']} IST",
+        f"⚖️ R:R = *1:{rr}*  |  RSI {rsi}  |  Vol {vol_x}× avg",
+        f"⏰ {signal['time']} IST",
     ]
     _send("\n".join(lines))
 

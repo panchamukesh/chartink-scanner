@@ -74,6 +74,17 @@ _last_refresh: datetime = None
 
 
 # ─── Indicators ───────────────────────────────────────────────────────────────
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average True Range — measures actual stock volatility."""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
@@ -112,6 +123,7 @@ def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
     rsi   = _rsi(close, 14)
+    atr   = _atr(high, low, close, 14)
 
     # Current and previous completed 5-min bar
     cur_close  = _safe(close,  -1)
@@ -179,6 +191,7 @@ def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
         "delivery":    round(delivery, 1),
         "pe":          0,
         "swing_trend": swing_trend,
+        "atr":         round(_safe(atr, -1), 2),
         "timeframe":   "5m",
     }
 
@@ -269,6 +282,29 @@ def refresh_intraday():
 
 
 # ─── Accessors ────────────────────────────────────────────────────────────────
+def get_nifty_trend() -> str:
+    """
+    Returns 'bullish' if Nifty 50 is above its 20 EMA on 5m chart, else 'bearish'.
+    Used as a market-wide filter — only take BUY signals in bullish market.
+    Uses yfinance for ^NSEI (single call, no Angel One rate impact).
+    """
+    try:
+        raw = yf.download("^NSEI", period="5d", interval="5m",
+                          auto_adjust=True, progress=False)
+        if raw is None or raw.empty:
+            return "bullish"
+        close = raw["Close"].dropna()
+        if len(close) < 20:
+            return "bullish"
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        trend = "bullish" if float(close.iloc[-1]) > float(ema20.iloc[-1]) else "bearish"
+        print(f"[data] Nifty: {float(close.iloc[-1]):.0f} vs EMA20 {float(ema20.iloc[-1]):.0f} → {trend}")
+        return trend
+    except Exception as e:
+        print(f"[data] Nifty trend error: {e}")
+        return "bullish"   # safe default — allow signals if Nifty data unavailable
+
+
 def get_all() -> list[dict]:
     with _cache_lock:
         return list(_cache.values())

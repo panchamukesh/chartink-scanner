@@ -1,168 +1,183 @@
 """
-Auto-scanner — runs every 5 minutes during NSE market hours (10:00–15:30 IST, Mon–Fri).
-Evaluates each stock against all active scan rules.
-Sends Telegram alerts for new signals and an EOD report at 15:35.
+MarketScan Pro — Signal Engine (v2 — Quality over Quantity)
+
+Philosophy:
+  - ONLY fire Pine Script crossover signals (4 rules total)
+  - Every signal passes 5 quality gates before Telegram
+  - ATR-based SL and Target (adapts to each stock's actual volatility)
+  - Maximum 5 signals per day — if you're getting more, something is wrong
+  - Zero noise tolerated
+
+Pine Script rules (SWING CALLS by nicks1008):
+  BUY  — EMA5 crosses above SMA50 AND high > SMA50
+  SELL — SMA50 crosses above EMA5 AND bearish candle
+  BUY  — RSI crosses above 20 (oversold reversal)
+  SELL — RSI crosses below 80 (overbought reversal)
+
+Quality gates (ALL must pass):
+  1. Nifty trend   — BUY only when Nifty above EMA20, SELL only when below
+  2. Volume        — Signal candle volume > 1.5× 20-bar average
+  3. RSI guard     — Swing BUY: RSI < 70  |  Swing SELL: RSI > 30
+  4. Session time  — Only 10:15 AM – 3:00 PM IST (skip open/close noise)
+  5. Daily cap     — Max 5 signals per day total
 """
 import threading
 import time as _time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as _time_t
 
 import data as _data
 import db as _db
 import notify as _notify
 
-# IST = UTC+5:30
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-# ─── Scan rule definitions (mirrors INDICATOR_LIBRARY in app.js) ──────────────
-SCAN_RULES = [
-    {"key": "supertrend_buy",    "name": "SuperTrend — Buy Signal",           "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema20"] and s["changePct"]>0 and s["rsi"]>50 and s["volume"]>s["avgVolume"]},
-    {"key": "macd_cross",        "name": "MACD — Bullish Crossover",          "signal": "BUY",
-     "cond": lambda s: s["ema20"]>s["ema50"] and s["close"]>s["ema20"] and s["changePct"]>0 and s["rsi"]>45},
-    {"key": "rsi_recovery",      "name": "RSI — Oversold Recovery",           "signal": "BUY",
-     "cond": lambda s: 40<s["rsi"]<60 and s["close"]>s["sma20"] and s["changePct"]>0},
-    {"key": "bollinger_breakout","name": "Bollinger Band — Upper Breakout",   "signal": "BUY",
-     "cond": lambda s: s["close"]>s["resistance"] and s["volume"]>s["avgVolume"] and s["changePct"]>1 and s["rsi"]<75},
-    {"key": "golden_cross",      "name": "Golden Cross — EMA 20/50",          "signal": "BUY",
-     "cond": lambda s: s["ema20"]>s["ema50"] and s["close"]>s["ema20"] and s["rsi"]>50 and s["changePct"]>0},
-    {"key": "vwap_breakout",     "name": "VWAP — Intraday Breakout",          "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema20"] and s["volume"]>s["avgVolume"] and s["changePct"]>0.5 and s["rsi"]>50},
-    {"key": "ssl_hybrid",        "name": "SSL Hybrid — Buy Zone",             "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema50"] and s["close"]>s["ema20"] and s["rsi"]>50 and s["ema20"]>s["ema50"]},
-    {"key": "volume_surge",      "name": "Volume Surge — Momentum Play",      "signal": "BUY",
-     "cond": lambda s: s["volume"]>s["avgVolume"] and s["changePct"]>2 and s["close"]>s["resistance"]},
-    {"key": "delivery_accum",    "name": "Delivery — Smart Money Accumulation","signal": "BUY",
-     "cond": lambda s: s["delivery"]>60 and s["changePct"]>0 and s["volume"]>s["avgVolume"] and s["rsi"]>45},
-    {"key": "high_breakout",     "name": "52-Week High — Fresh Breakout",     "signal": "BUY",
-     "cond": lambda s: s["close"]>s["resistance"] and s["changePct"]>1 and s["volume"]>s["avgVolume"] and s["rsi"]>55},
-    {"key": "ema_pullback",      "name": "EMA 20 — Healthy Pullback Buy",     "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema20"] and 45<s["rsi"]<65 and s["changePct"]>0 and s["ema20"]>s["ema50"]},
-    {"key": "stoch_rsi",         "name": "Stochastic RSI — Buy Cross",        "signal": "BUY",
-     "cond": lambda s: 50<s["rsi"]<70 and s["close"]>s["ema20"] and s["volume"]>s["avgVolume"] and s["changePct"]>0},
-    {"key": "adx_trend",         "name": "ADX — Strong Trend Momentum",       "signal": "BUY",
-     "cond": lambda s: s["rsi"]>55 and s["close"]>s["ema20"] and s["close"]>s["ema50"] and s["changePct"]>0.5 and s["volume"]>s["avgVolume"]},
-    {"key": "price_action_bull", "name": "Price Action — Strong Bull Candle", "signal": "BUY",
-     "cond": lambda s: s["changePct"]>1 and s["delivery"]>50 and s["close"]>s["ema20"] and s["volume"]>s["avgVolume"]},
-    {"key": "obv_rising",        "name": "OBV — Rising Volume Trend",         "signal": "BUY",
-     "cond": lambda s: s["volume"]>s["avgVolume"] and s["changePct"]>0 and s["close"]>s["ema20"] and s["delivery"]>55 and s["rsi"]>50},
-    {"key": "ttm_squeeze",       "name": "TTM Squeeze — Momentum Fire",       "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema20"] and s["rsi"]>52 and s["volume"]>s["avgVolume"] and s["changePct"]>1 and s["ema20"]>s["ema50"]},
-    {"key": "ichimoku_buy",      "name": "Ichimoku Cloud — Kumo Breakout",    "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema50"] and s["ema20"]>s["ema50"] and s["rsi"]>52 and s["changePct"]>0},
-    {"key": "pivot_breakout",    "name": "Pivot Point — Resistance Break",    "signal": "BUY",
-     "cond": lambda s: s["close"]>s["resistance"] and s["changePct"]>1.5 and s["volume"]>s["avgVolume"] and s["rsi"]>55},
-    {"key": "cci_bull",          "name": "CCI — Bullish Momentum",            "signal": "BUY",
-     "cond": lambda s: s["rsi"]>50 and s["close"]>s["sma20"] and s["volume"]>s["avgVolume"] and s["changePct"]>0},
-    {"key": "demand_zone",       "name": "Demand Zone — Supply Reversal",     "signal": "BUY",
-     "cond": lambda s: s["close"]>s["ema50"] and 48<s["rsi"]<62 and s["delivery"]>50 and s["changePct"]>0},
-    # SELL / Distribution scans
-    {"key": "overbought_sell",   "name": "RSI Overbought — Distribution",     "signal": "SELL",
-     "cond": lambda s: s["rsi"]>72 and s["changePct"]<0 and s["volume"]>s["avgVolume"]},
-    {"key": "breakdown_sell",    "name": "Breakdown — Below Support",         "signal": "SELL",
-     "cond": lambda s: s["close"]<s["ema50"] and s["close"]<s["ema20"] and s["changePct"]<-1.5 and s["volume"]>s["avgVolume"]},
+# ── In-memory state: tracks which stocks currently match each rule ─────────────
+_active: dict = {}          # rule_key → set[symbol]
+_nifty_trend: str = "bullish"   # updated each refresh cycle
 
-    # ── Pine Script: SWING CALLS (nicks1008) ─────────────────────────────────
-    # buycall = crossunder(sma2, ema1) and high > sma2
-    #   i.e. EMA5 just crossed ABOVE SMA50 AND high is above SMA50
-    {"key": "pine_swing_buy",
-     "name": "🔵 Swing BUY — EMA5 × SMA50 Bullish Cross",
-     "signal": "BUY",
-     "cond": lambda s: (
-         s.get("prev_sma50", 0) >= s.get("prev_ema5", 0)   # previous: SMA50 was above EMA5
-         and s.get("sma50", 0) < s.get("ema5", 0)           # now: EMA5 crossed above SMA50
-         and s["high"] > s.get("sma50", 0)                  # high is above SMA50
-     )},
 
-    # sellcall = crossover(sma2, ema1) and open > close
-    #   i.e. SMA50 just crossed ABOVE EMA5 AND bearish candle (close < open)
-    {"key": "pine_swing_sell",
-     "name": "🔴 Swing SELL — SMA50 × EMA5 Bearish Cross",
-     "signal": "SELL",
-     "cond": lambda s: (
-         s.get("prev_sma50", 0) <= s.get("prev_ema5", 0)   # previous: EMA5 was above SMA50
-         and s.get("sma50", 0) > s.get("ema5", 0)           # now: SMA50 crossed above EMA5
-         and s["changePct"] < 0                              # close < open (bearish candle)
-     )},
-
-    # sellexit = crossover(rs, ll=20) → RSI crosses above 20 = oversold reversal BUY
-    {"key": "pine_rsi_reversal_buy",
-     "name": "⬆️ Swing RSI Reversal — Oversold Exit BUY",
-     "signal": "BUY",
-     "cond": lambda s: s.get("prev_rsi", 50) <= 20 and s["rsi"] > 20},
-
-    # buyexit = crossunder(rs, hl=80) → RSI crosses under 80 = overbought reversal SELL
-    {"key": "pine_rsi_reversal_sell",
-     "name": "⬇️ Swing RSI Reversal — Overbought Exit SELL",
-     "signal": "SELL",
-     "cond": lambda s: s.get("prev_rsi", 50) >= 80 and s["rsi"] < 80},
+# ── Pine Script rules ONLY (no generic indicator library) ─────────────────────
+ACTIVE_RULES = [
+    {
+        "key":    "pine_swing_buy",
+        "name":   "Swing BUY — EMA5 × SMA50 Cross",
+        "signal": "BUY",
+        # buycall = crossunder(sma2, ema1) and high > sma2
+        "cond": lambda s: (
+            s.get("prev_sma50", 0) >= s.get("prev_ema5", 0)
+            and s.get("sma50", 0) < s.get("ema5", 0)
+            and s["high"] > s.get("sma50", 0)
+        ),
+    },
+    {
+        "key":    "pine_swing_sell",
+        "name":   "Swing SELL — SMA50 × EMA5 Cross",
+        "signal": "SELL",
+        # sellcall = crossover(sma2, ema1) and open > close
+        "cond": lambda s: (
+            s.get("prev_sma50", 0) <= s.get("prev_ema5", 0)
+            and s.get("sma50", 0) > s.get("ema5", 0)
+            and s["changePct"] < 0
+        ),
+    },
+    {
+        "key":    "pine_rsi_bull",
+        "name":   "RSI Reversal BUY — Oversold Exit",
+        "signal": "BUY",
+        # sellexit = crossover(rs, ll=20)
+        "cond": lambda s: s.get("prev_rsi", 50) <= 20 and s["rsi"] > 20,
+    },
+    {
+        "key":    "pine_rsi_bear",
+        "name":   "RSI Reversal SELL — Overbought Exit",
+        "signal": "SELL",
+        # buyexit = crossunder(rs, hl=80)
+        "cond": lambda s: s.get("prev_rsi", 50) >= 80 and s["rsi"] < 80,
+    },
 ]
 
-# Active rules — all enabled by default; Pine Script rules appended here later
-ACTIVE_RULES = list(SCAN_RULES)
+# Keep for webhook compatibility
+PINE_KEYS = {r["key"] for r in ACTIVE_RULES}
 
-# Target/SL percentages — default (indicator library scans)
-BUY_TARGET_PCT  =  3.0
-BUY_SL_PCT      = -1.5
-SELL_TARGET_PCT = -3.0
-SELL_SL_PCT     =  1.5
-
-# Swing trade targets (Pine Script: SWING CALLS) — wider as swing holds overnight
-SWING_BUY_TARGET_PCT  =  5.0
-SWING_BUY_SL_PCT      = -2.0
-SWING_SELL_TARGET_PCT = -5.0
-SWING_SELL_SL_PCT     =  2.0
-
-PINE_KEYS = {"pine_swing_buy", "pine_swing_sell", "pine_rsi_reversal_buy", "pine_rsi_reversal_sell"}
+MAX_SIGNALS_PER_DAY = 5
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _ist_now() -> datetime:
     return datetime.now(_IST)
 
 
 def _is_market_open() -> bool:
     now = _ist_now()
-    if now.weekday() >= 5:          # Saturday / Sunday
+    if now.weekday() >= 5:
         return False
-    t = now.time()
-    from datetime import time
-    return time(10, 0) <= t <= time(15, 30)
+    return _time_t(10, 0) <= now.time() <= _time_t(15, 30)
 
 
-def _calc_targets(price, signal_type, is_swing=False):
-    if is_swing:
-        tgt_pct = SWING_BUY_TARGET_PCT  if signal_type == "BUY" else SWING_SELL_TARGET_PCT
-        sl_pct  = SWING_BUY_SL_PCT      if signal_type == "BUY" else SWING_SELL_SL_PCT
+def _in_signal_window() -> bool:
+    """Only fire signals between 10:15 AM and 3:00 PM IST."""
+    t = _ist_now().time()
+    return _time_t(10, 15) <= t <= _time_t(15, 0)
+
+
+def _calc_targets(price: float, signal_type: str, atr: float = 0.0):
+    """
+    ATR-based SL and Target.
+      SL     = 1.5 × ATR  (tight enough to stop early, wide enough for noise)
+      Target = 3.0 × ATR  (2:1 R:R minimum — only worth taking quality setups)
+    Falls back to fixed 2% / 4% if ATR unavailable.
+    """
+    if atr and atr > 0:
+        sl_dist  = round(1.5 * atr, 2)
+        tgt_dist = round(3.0 * atr, 2)
     else:
-        tgt_pct = BUY_TARGET_PCT  if signal_type == "BUY" else SELL_TARGET_PCT
-        sl_pct  = BUY_SL_PCT      if signal_type == "BUY" else SELL_SL_PCT
-    return round(price * (1 + tgt_pct / 100), 2), round(price * (1 + sl_pct / 100), 2)
+        sl_dist  = round(price * 0.02, 2)    # 2% fallback
+        tgt_dist = round(price * 0.04, 2)    # 4% fallback
+
+    if signal_type == "BUY":
+        return round(price + tgt_dist, 2), round(price - sl_dist, 2)
+    else:
+        return round(price - tgt_dist, 2), round(price + sl_dist, 2)
 
 
-# ── State tracker: rule_key → set of symbols currently matching ───────────────
-# A Telegram alert fires ONLY when a symbol newly ENTERS the matching set.
-# No alert if it was already there last cycle — even after 100 cycles.
-# Alert fires again only when it EXITS and then re-ENTERS.
-_active: dict = {}   # rule_key → set[symbol]
+def _passes_quality(stock: dict, rule: dict) -> tuple[bool, str]:
+    """
+    5 quality gates — ALL must pass.
+    Returns (passed: bool, reason: str).
+    """
+    signal = rule["signal"]
+    rkey   = rule["key"]
+
+    # Gate 1 — Nifty trend
+    if signal == "BUY" and _nifty_trend == "bearish":
+        return False, "Nifty below EMA20 — no BUY signals in falling market"
+    if signal == "SELL" and _nifty_trend == "bullish":
+        return False, "Nifty above EMA20 — no SELL signals in rising market"
+
+    # Gate 2 — Volume conviction (RSI reversals exempt — they work on thin volume)
+    if rkey in {"pine_swing_buy", "pine_swing_sell"}:
+        if stock["volume"] < stock["avgVolume"] * 1.5:
+            return False, f"Volume weak ({stock['volume']:,} < 1.5× avg {stock['avgVolume']:,})"
+
+    # Gate 3 — RSI guard (don't chase extended moves)
+    if rkey == "pine_swing_buy" and stock["rsi"] > 70:
+        return False, f"RSI overbought ({stock['rsi']}) — BUY signal in exhausted move"
+    if rkey == "pine_swing_sell" and stock["rsi"] < 30:
+        return False, f"RSI oversold ({stock['rsi']}) — SELL signal in exhausted move"
+
+    # Gate 4 — Session time window
+    if not _in_signal_window():
+        return False, "Outside signal window (10:15–15:00 IST)"
+
+    # Gate 5 — Daily cap
+    if _db.count_today() >= MAX_SIGNALS_PER_DAY:
+        return False, f"Daily cap of {MAX_SIGNALS_PER_DAY} reached"
+
+    return True, "All gates passed ✅"
 
 
+# ── Main scan cycle ───────────────────────────────────────────────────────────
 def _run_scan_cycle():
     """
-    Evaluate all rules against cached stock data.
-
-    Key dedup rules:
-    1. State-based: alert only when stock NEWLY enters a condition this cycle
-    2. Per-stock cooldown (120 min): if ANY scan fired for this stock recently → skip
-    3. Group: all matching scans for the same stock → ONE Telegram message (not 8)
+    Evaluate 4 Pine Script rules against live 5m data.
+    Only fire when a stock NEWLY enters a condition AND all 5 quality gates pass.
+    One Telegram message per stock per cooldown window (2h).
     """
+    global _nifty_trend
+
     stocks = _data.get_all()
     if not stocks:
-        print("[scanner] No cached data — skipping")
+        print("[scanner] No data — skipping")
         return
 
-    # Step 1: find all NEW matches per stock (across all rules)
-    # Structure: symbol → list of matching rules
-    new_by_stock: dict = {}
+    # Refresh Nifty trend each cycle
+    try:
+        _nifty_trend = _data.get_nifty_trend()
+        print(f"[scanner] Nifty trend: {_nifty_trend}")
+    except Exception as e:
+        print(f"[scanner] Nifty trend error: {e}")
+
+    fired = 0
 
     for rule in ACTIVE_RULES:
         rkey     = rule["key"]
@@ -176,87 +191,75 @@ def _run_scan_cycle():
             except Exception:
                 continue
 
-        new_entries = curr_set - prev_set   # stocks that JUST entered this condition
-        _active[rkey] = curr_set            # update state
+        new_entries = curr_set - prev_set   # NEWLY matching stocks only
+        _active[rkey] = curr_set
 
         for symbol in new_entries:
-            new_by_stock.setdefault(symbol, []).append(rule)
+            stock = next((s for s in stocks if s["symbol"] == symbol), None)
+            if not stock:
+                continue
 
-    if not new_by_stock:
-        return
+            # Quality gates
+            passed, reason = _passes_quality(stock, rule)
+            if not passed:
+                print(f"[scanner] ⛔ {symbol} blocked — {reason}")
+                continue
 
-    # Step 2: for each stock with new matches, apply per-stock cooldown
-    fired = 0
-    for symbol, matched_rules in new_by_stock.items():
-        stock = next((s for s in stocks if s["symbol"] == symbol), None)
-        if not stock:
-            continue
+            # Per-stock DB cooldown (2h)
+            if _db.already_signaled(symbol, cooldown_min=120):
+                print(f"[scanner] ⏭  {symbol} — cooldown active")
+                continue
 
-        # Per-stock cooldown: skip if this stock already signaled in last 2 hours
-        if _db.already_signaled(symbol, cooldown_min=120):
-            print(f"[scanner] ⏭  {symbol} skipped (cooldown active)")
-            continue
+            price    = stock["close"]
+            atr      = stock.get("atr", 0)
+            target, sl = _calc_targets(price, rule["signal"], atr=atr)
+            rr = round(abs(target - price) / abs(price - sl), 1) if abs(price - sl) > 0 else 0
 
-        # Use the STRONGEST / highest-priority match as the primary signal
-        # Priority: Pine Script > Breakout > BUY > SELL
-        def rule_priority(r):
-            if r["key"] in PINE_KEYS:       return 0
-            if "breakout" in r["key"]:      return 1
-            if r["signal"] == "BUY":        return 2
-            return 3
+            sig_id = _db.insert_signal(
+                symbol      = symbol,
+                name        = stock["name"],
+                sector      = stock["sector"],
+                signal_type = rule["signal"],
+                scan_name   = rule["name"],
+                price       = price,
+                target      = target,
+                sl          = sl,
+            )
 
-        matched_rules.sort(key=rule_priority)
-        primary   = matched_rules[0]
-        price     = stock["close"]
-        is_swing  = primary["key"] in PINE_KEYS
-        target, sl = _calc_targets(price, primary["signal"], is_swing=is_swing)
+            signal = dict(
+                id          = sig_id,
+                symbol      = symbol,
+                name        = stock["name"],
+                sector      = stock["sector"],
+                signal_type = rule["signal"],
+                scan_name   = rule["name"],
+                scan_key    = rkey,
+                price       = price,
+                target      = target,
+                sl          = sl,
+                atr         = atr,
+                rr          = rr,
+                time        = _ist_now().strftime("%H:%M"),
+                swing_trend = stock.get("swing_trend", ""),
+                nifty_trend = _nifty_trend,
+                rsi         = stock.get("rsi", 0),
+                volume      = stock["volume"],
+                avg_volume  = stock["avgVolume"],
+            )
+            _notify.send_signal(signal)
+            fired += 1
+            print(f"[scanner] ✅ SIGNAL: {rule['signal']} {symbol} "
+                  f"| Entry {price} | Target {target} | SL {sl} | R:R 1:{rr}")
 
-        # Build a combined scan name listing all matches (max 3)
-        scan_labels = [r["name"] for r in matched_rules[:3]]
-        if len(matched_rules) > 3:
-            scan_labels.append(f"+{len(matched_rules)-3} more")
-        combined_scan_name = " · ".join(scan_labels)
-
-        sig_id = _db.insert_signal(
-            symbol      = symbol,
-            name        = stock["name"],
-            sector      = stock["sector"],
-            signal_type = primary["signal"],
-            scan_name   = combined_scan_name,
-            price       = price,
-            target      = target,
-            sl          = sl,
-        )
-
-        signal = dict(
-            id          = sig_id,
-            symbol      = symbol,
-            name        = stock["name"],
-            sector      = stock["sector"],
-            signal_type = primary["signal"],
-            scan_name   = combined_scan_name,
-            scan_key    = primary["key"],
-            price       = price,
-            target      = target,
-            sl          = sl,
-            time        = _ist_now().strftime("%H:%M"),
-            swing_trend = stock.get("swing_trend", ""),
-            match_count = len(matched_rules),
-        )
-        _notify.send_signal(signal)
-        fired += 1
-        print(f"[scanner] 🔔 {primary['signal']} {symbol} "
-              f"({len(matched_rules)} scan matches) — {primary['name']}")
-
-    if fired:
-        print(f"[scanner] ✅ {fired} stock(s) alerted at {_ist_now().strftime('%H:%M:%S')}")
+    today_count = _db.count_today()
+    print(f"[scanner] Cycle done — {fired} new signal(s) | {today_count}/{MAX_SIGNALS_PER_DAY} today")
 
 
+# ── EOD report ────────────────────────────────────────────────────────────────
 def _eod_report():
-    """Fetch EOD prices, update DB, send consolidated report."""
     print("[scanner] Running EOD report …")
     try:
-        _data.refresh_all()   # get final prices
+        _data.smart_refresh()
     except Exception as e:
         print(f"[scanner] EOD refresh error: {e}")
 
@@ -266,62 +269,51 @@ def _eod_report():
 
     signals = _db.get_signals_today()
     _notify.send_eod_report(signals)
-    print(f"[scanner] EOD report sent — {len(signals)} signal(s)")
+    print(f"[scanner] EOD report sent — {len(signals)} signal(s) today")
 
 
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def _loop():
-    """
-    Background thread — fully automatic, no user interaction needed.
-
-    Schedule (IST):
-      10:00       — load 1-year daily data (indicators: EMA5, SMA50, RSI, etc.)
-      10:00-15:30 — refresh live 1-min bars + run scan rules EVERY 60 SECONDS
-                    alert fires only when a stock NEWLY enters a scan condition
-      15:35       — EOD report: target/SL hit status, P&L%, consolidated Telegram message
-    """
     opened_today   = False
     eod_sent_today = False
     last_scan      = None
 
-    print("[scanner] Auto-scanner started — will activate at next market open (10:00 IST)")
+    print("[scanner] v2 started — Pine Script signals only, 5 quality gates active")
 
     while True:
         now = _ist_now()
 
-        # ── Midnight reset ────────────────────────────────────────────────────
-        if now.hour == 0 and now.minute < 1:
-            opened_today   = False
+        # Midnight reset
+        if now.hour == 0 and now.minute < 2:
+            opened_today = False
             eod_sent_today = False
-            _active.clear()   # reset state so day's fresh conditions trigger cleanly
+            _active.clear()
 
-        # ── Market open: initial 5m data load ────────────────────────────────
+        # Market open — load fresh data
         if _is_market_open() and not opened_today:
-            print("[scanner] 🔔 Market open — loading 5-min bars for all 45 stocks …")
+            print("[scanner] Market open — loading 5m data …")
             try:
                 _data.smart_refresh()
                 opened_today = True
-                print("[scanner] ✅ 5m data ready — scanning every 60 seconds on 5-min timeframe")
+                print("[scanner] Data ready ✅")
             except Exception as e:
-                print(f"[scanner] 5m load error: {e}")
+                print(f"[scanner] Open refresh error: {e}")
 
-        # ── Every 2 minutes: refresh 5m bars + run scan ───────────────────────
-        # Angel One historical API: ~1.1s/stock × 45 stocks = ~50s fetch time.
-        # 120s cycle gives a comfortable buffer. Signals still fire within
-        # 2 minutes of a 5m candle closing — accurate enough for swing calls.
+        # Every 2 minutes — refresh + scan
         if _is_market_open() and opened_today:
-            if last_scan is None or (now - last_scan).seconds >= 120:
+            elapsed = (now - last_scan).seconds if last_scan else 999
+            if elapsed >= 120:
                 try:
-                    _data.smart_refresh()      # fetch latest completed 5-min bar
+                    _data.smart_refresh()
                 except Exception as e:
-                    print(f"[scanner] 5m refresh error: {e}")
+                    print(f"[scanner] Refresh error: {e}")
                 try:
-                    _run_scan_cycle()       # check conditions, alert only on new entries
+                    _run_scan_cycle()
                 except Exception as e:
                     print(f"[scanner] Scan error: {e}")
                 last_scan = now
 
-        # ── EOD report at 15:35 ───────────────────────────────────────────────
-        from datetime import time as _time_t
+        # EOD at 15:35
         if (now.weekday() < 5
                 and now.time() >= _time_t(15, 35)
                 and not eod_sent_today):
@@ -331,26 +323,24 @@ def _loop():
                 print(f"[scanner] EOD error: {e}")
             eod_sent_today = True
 
-        _time.sleep(15)   # tight loop — 15s sleep so 60s trigger is accurate
+        _time.sleep(15)
 
 
 def start():
-    """Start the background scanner thread (call once at app startup)."""
     _db.init_db()
 
-    # Initialise Angel One real-time data source
+    # Angel One init
     try:
         import angel_data as _angel
-        import data as _data_mod
-        print("[scanner] Connecting to Angel One SmartAPI …")
+        print("[scanner] Connecting to Angel One …")
         if _angel.login():
-            _angel.build_token_map(_data_mod.UNIVERSE)
-            print("[scanner] ✅ Angel One ready — real-time NSE data active")
+            _angel.build_token_map(_data.UNIVERSE)
+            print("[scanner] Angel One ready ✅")
         else:
-            print("[scanner] ⚠️  Angel One login failed — will use Yahoo Finance (delayed)")
+            print("[scanner] Angel One login failed — using Yahoo Finance fallback")
     except Exception as e:
-        print(f"[scanner] Angel One init error: {e} — falling back to Yahoo Finance")
+        print(f"[scanner] Angel One init error: {e}")
 
     t = threading.Thread(target=_loop, daemon=True, name="scanner")
     t.start()
-    print("[scanner] Auto-scanner started")
+    print("[scanner] Started")

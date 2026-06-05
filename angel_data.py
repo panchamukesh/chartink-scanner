@@ -162,6 +162,12 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return (100 - 100 / (1 + rs)).round(2)
 
 
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+
 def _safe(series: pd.Series, idx: int = -1) -> float:
     try:
         v = float(series.iloc[idx])
@@ -251,6 +257,7 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
         "delivery":    round(delivery, 1),
         "pe":          0,
         "swing_trend": swing_trend,
+        "atr":         round(_safe(_atr(high, low, close, 14), -1), 2),
         "timeframe":   "5m",
         "source":      "angel_one",
     }
