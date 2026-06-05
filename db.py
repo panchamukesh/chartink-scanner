@@ -38,14 +38,18 @@ def init_db():
         c.commit()
 
 
-def already_signaled(symbol, scan_name, cooldown_min=60):
-    """Return True if same stock+scan fired within cooldown window today."""
-    date = datetime.now().strftime("%Y-%m-%d")
+def already_signaled(symbol, scan_name=None, cooldown_min=120):
+    """
+    Per-STOCK cooldown (not per scan).
+    If this stock fired ANY signal in the last cooldown_min minutes → skip.
+    This prevents the same stock appearing in 8 different scan alerts at once.
+    scan_name param kept for backward compat but ignored.
+    """
     cutoff = (datetime.now() - timedelta(minutes=cooldown_min)).strftime("%Y-%m-%d %H:%M:%S")
     with _conn() as c:
         row = c.execute(
-            "SELECT id FROM signals WHERE date=? AND symbol=? AND scan_name=? AND created_at > ?",
-            (date, symbol, scan_name, cutoff),
+            "SELECT id FROM signals WHERE symbol=? AND created_at > ?",
+            (symbol, cutoff),
         ).fetchone()
     return row is not None
 

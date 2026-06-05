@@ -149,16 +149,23 @@ _active: dict = {}   # rule_key → set[symbol]
 def _run_scan_cycle():
     """
     Evaluate all rules against cached stock data.
-    Alerts only for symbols that NEWLY match this cycle (weren't matching last cycle).
+
+    Key dedup rules:
+    1. State-based: alert only when stock NEWLY enters a condition this cycle
+    2. Per-stock cooldown (120 min): if ANY scan fired for this stock recently → skip
+    3. Group: all matching scans for the same stock → ONE Telegram message (not 8)
     """
     stocks = _data.get_all()
     if not stocks:
         print("[scanner] No cached data — skipping")
         return
 
-    fired = 0
+    # Step 1: find all NEW matches per stock (across all rules)
+    # Structure: symbol → list of matching rules
+    new_by_stock: dict = {}
+
     for rule in ACTIVE_RULES:
-        rkey = rule["key"]
+        rkey     = rule["key"]
         prev_set = _active.get(rkey, set())
         curr_set = set()
 
@@ -169,54 +176,80 @@ def _run_scan_cycle():
             except Exception:
                 continue
 
-        # Only symbols that NEWLY entered the condition this cycle
-        new_entries = curr_set - prev_set
-        _active[rkey] = curr_set   # update state regardless
+        new_entries = curr_set - prev_set   # stocks that JUST entered this condition
+        _active[rkey] = curr_set            # update state
 
         for symbol in new_entries:
-            stock = next((s for s in stocks if s["symbol"] == symbol), None)
-            if not stock:
-                continue
+            new_by_stock.setdefault(symbol, []).append(rule)
 
-            # Secondary DB guard: skip if same rule fired for this stock
-            # within the last 2 hours (protects against state resets on restart)
-            if _db.already_signaled(symbol, rule["name"], cooldown_min=120):
-                continue
+    if not new_by_stock:
+        return
 
-            price    = stock["close"]
-            is_swing = rkey in PINE_KEYS
-            target, sl = _calc_targets(price, rule["signal"], is_swing=is_swing)
+    # Step 2: for each stock with new matches, apply per-stock cooldown
+    fired = 0
+    for symbol, matched_rules in new_by_stock.items():
+        stock = next((s for s in stocks if s["symbol"] == symbol), None)
+        if not stock:
+            continue
 
-            sig_id = _db.insert_signal(
-                symbol      = symbol,
-                name        = stock["name"],
-                sector      = stock["sector"],
-                signal_type = rule["signal"],
-                scan_name   = rule["name"],
-                price       = price,
-                target      = target,
-                sl          = sl,
-            )
-            signal = dict(
-                id          = sig_id,
-                symbol      = symbol,
-                name        = stock["name"],
-                sector      = stock["sector"],
-                signal_type = rule["signal"],
-                scan_name   = rule["name"],
-                scan_key    = rkey,
-                price       = price,
-                target      = target,
-                sl          = sl,
-                time        = _ist_now().strftime("%H:%M"),
-                swing_trend = stock.get("swing_trend", ""),
-            )
-            _notify.send_signal(signal)
-            fired += 1
-            print(f"[scanner] 🔔 {rule['signal']} {symbol} — {rule['name']}")
+        # Per-stock cooldown: skip if this stock already signaled in last 2 hours
+        if _db.already_signaled(symbol, cooldown_min=120):
+            print(f"[scanner] ⏭  {symbol} skipped (cooldown active)")
+            continue
+
+        # Use the STRONGEST / highest-priority match as the primary signal
+        # Priority: Pine Script > Breakout > BUY > SELL
+        def rule_priority(r):
+            if r["key"] in PINE_KEYS:       return 0
+            if "breakout" in r["key"]:      return 1
+            if r["signal"] == "BUY":        return 2
+            return 3
+
+        matched_rules.sort(key=rule_priority)
+        primary   = matched_rules[0]
+        price     = stock["close"]
+        is_swing  = primary["key"] in PINE_KEYS
+        target, sl = _calc_targets(price, primary["signal"], is_swing=is_swing)
+
+        # Build a combined scan name listing all matches (max 3)
+        scan_labels = [r["name"] for r in matched_rules[:3]]
+        if len(matched_rules) > 3:
+            scan_labels.append(f"+{len(matched_rules)-3} more")
+        combined_scan_name = " · ".join(scan_labels)
+
+        sig_id = _db.insert_signal(
+            symbol      = symbol,
+            name        = stock["name"],
+            sector      = stock["sector"],
+            signal_type = primary["signal"],
+            scan_name   = combined_scan_name,
+            price       = price,
+            target      = target,
+            sl          = sl,
+        )
+
+        signal = dict(
+            id          = sig_id,
+            symbol      = symbol,
+            name        = stock["name"],
+            sector      = stock["sector"],
+            signal_type = primary["signal"],
+            scan_name   = combined_scan_name,
+            scan_key    = primary["key"],
+            price       = price,
+            target      = target,
+            sl          = sl,
+            time        = _ist_now().strftime("%H:%M"),
+            swing_trend = stock.get("swing_trend", ""),
+            match_count = len(matched_rules),
+        )
+        _notify.send_signal(signal)
+        fired += 1
+        print(f"[scanner] 🔔 {primary['signal']} {symbol} "
+              f"({len(matched_rules)} scan matches) — {primary['name']}")
 
     if fired:
-        print(f"[scanner] {fired} new signal(s) sent at {_ist_now().strftime('%H:%M:%S')}")
+        print(f"[scanner] ✅ {fired} stock(s) alerted at {_ist_now().strftime('%H:%M:%S')}")
 
 
 def _eod_report():

@@ -46,12 +46,14 @@ def send_signal(signal):
     elif trend == "bearish":
         trend_str = "  |  📉 Trend: Bearish (price below SMA50)"
 
-    tag = "🔄 *SWING CALL*" if is_swing else "📊 *Scan Signal*"
+    tag        = "🔄 *SWING CALL*" if is_swing else "📊 *Scan Signal*"
+    match_count = signal.get("match_count", 1)
+    strength   = f"  |  💪 {match_count} scans confirm" if match_count > 1 else ""
 
     lines = [
         f"{emoji} {tag} — *{signal['symbol']}*  [{signal['signal_type']}]",
         f"📋 _{signal['scan_name']}_",
-        f"🏭 {signal.get('sector', '—')}{trend_str}",
+        f"🏭 {signal.get('sector', '—')}{trend_str}{strength}",
         f"",
         f"💰 Entry:  ₹{price:,.2f}",
         f"🎯 Target: ₹{signal['target']:,.2f}  ({pnl_dir}{tgt_pct}%)",

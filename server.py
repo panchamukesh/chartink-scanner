@@ -218,48 +218,55 @@ def test_scan():
     stocks  = _data.get_all()
     results = []
 
-    # 2 — evaluate every rule against every stock (no cooldown check)
+    # 2 — group all matching scans per stock → ONE alert per stock (same as live scanner)
+    matches_by_stock = {}
     for rule in scanner.ACTIVE_RULES:
         for stock in stocks:
             try:
                 matched = rule["cond"](stock)
             except Exception:
                 matched = False
-            if not matched:
-                continue
+            if matched:
+                matches_by_stock.setdefault(stock["symbol"], {"stock": stock, "rules": []})["rules"].append(rule)
 
-            price    = stock["close"]
-            is_swing = rule["key"] in scanner.PINE_KEYS
-            target, sl = scanner._calc_targets(price, rule["signal"], is_swing=is_swing)
+    for symbol, item in matches_by_stock.items():
+        stock = item["stock"]
+        rules = item["rules"]
 
-            # Save to DB so EOD report can track it
-            sig_id = db.insert_signal(
-                symbol      = stock["symbol"],
-                name        = stock["name"],
-                sector      = stock["sector"],
-                signal_type = rule["signal"],
-                scan_name   = f"[TEST] {rule['name']}",
-                price       = price,
-                target      = target,
-                sl          = sl,
-            )
-            sig = dict(
-                id          = sig_id,
-                symbol      = stock["symbol"],
-                name        = stock["name"],
-                sector      = stock["sector"],
-                signal_type = rule["signal"],
-                scan_name   = f"[TEST] {rule['name']}",
-                scan_key    = rule["key"],
-                price       = price,
-                target      = target,
-                sl          = sl,
-                time        = datetime.now(_IST).strftime("%H:%M"),
-                swing_trend = stock.get("swing_trend", ""),
-            )
-            _notify.send_signal(sig)
-            results.append(sig)
-            print(f"[test-scan] {rule['signal']} {stock['symbol']} via {rule['name']}")
+        # Sort by priority, pick primary
+        def rule_priority(r):
+            if r["key"] in scanner.PINE_KEYS: return 0
+            if "breakout" in r["key"]:        return 1
+            if r["signal"] == "BUY":          return 2
+            return 3
+        rules.sort(key=rule_priority)
+        primary = rules[0]
+
+        price    = stock["close"]
+        is_swing = primary["key"] in scanner.PINE_KEYS
+        target, sl = scanner._calc_targets(price, primary["signal"], is_swing=is_swing)
+
+        labels = [r["name"] for r in rules[:3]]
+        if len(rules) > 3:
+            labels.append(f"+{len(rules)-3} more")
+        scan_name = "[TEST] " + " · ".join(labels)
+
+        sig_id = db.insert_signal(
+            symbol=symbol, name=stock["name"], sector=stock["sector"],
+            signal_type=primary["signal"], scan_name=scan_name,
+            price=price, target=target, sl=sl,
+        )
+        sig = dict(
+            id=sig_id, symbol=symbol, name=stock["name"], sector=stock["sector"],
+            signal_type=primary["signal"], scan_name=scan_name,
+            scan_key=primary["key"], price=price, target=target, sl=sl,
+            time=datetime.now(_IST).strftime("%H:%M"),
+            swing_trend=stock.get("swing_trend", ""),
+            match_count=len(rules),
+        )
+        _notify.send_signal(sig)
+        results.append(sig)
+        print(f"[test-scan] {primary['signal']} {symbol} ({len(rules)} matches)")
 
     # 3 — if nothing matched, still send an info message
     if not results:
