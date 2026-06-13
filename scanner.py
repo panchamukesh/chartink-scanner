@@ -392,10 +392,40 @@ def _eod_report():
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
+def _premarket_job():
+    print("[scanner] Sending pre-market briefing …")
+    try:
+        import premarket as _premarket
+        _premarket.send_premarket_report()
+    except Exception as e:
+        print(f"[scanner] Premarket error: {e}")
+
+
+def _weekly_backtest_job():
+    print("[scanner] Running weekly auto-backtest …")
+    try:
+        import io, contextlib, backtest as _backtest
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _backtest.run()
+        out = buf.getvalue()
+        # Trim to the report section (after the separator) to keep it Telegram-sized
+        idx = out.find("BACKTEST REPORT")
+        report = out[idx:] if idx >= 0 else out
+        if len(report) > 3800:
+            report = report[:3800] + "\n… (truncated)"
+        _notify._send("🧪 *Weekly Auto-Backtest*\n```\n" + report + "\n```")
+        print("[scanner] Weekly backtest sent")
+    except Exception as e:
+        print(f"[scanner] Weekly backtest error: {e}")
+
+
 def _loop():
-    opened_today   = False
-    eod_sent_today = False
-    last_scan      = None
+    opened_today      = False
+    eod_sent_today    = False
+    premarket_sent    = False
+    backtest_sent_wk  = None   # ISO week number when last sent
+    last_scan         = None
 
     print("[scanner] v3 started — Pine Script signals + 10-gate confirmation stack active")
 
@@ -404,9 +434,31 @@ def _loop():
 
         # Midnight reset
         if now.hour == 0 and now.minute < 2:
-            opened_today = False
+            opened_today   = False
             eod_sent_today = False
+            premarket_sent = False
             _active.clear()
+
+        # Pre-market briefing — 8:30 AM IST, weekdays only
+        if (now.weekday() < 5
+                and now.time() >= _time_t(8, 30)
+                and now.time() < _time_t(9, 15)
+                and not premarket_sent):
+            try:
+                _premarket_job()
+            except Exception as e:
+                print(f"[scanner] Premarket error: {e}")
+            premarket_sent = True
+
+        # Weekly auto-backtest — Sunday, once per week
+        if now.weekday() == 6 and now.time() >= _time_t(9, 0):
+            wk = now.isocalendar()[1]
+            if backtest_sent_wk != wk:
+                try:
+                    _weekly_backtest_job()
+                except Exception as e:
+                    print(f"[scanner] Weekly backtest error: {e}")
+                backtest_sent_wk = wk
 
         # Market open — load fresh data
         if _is_market_open() and not opened_today:
