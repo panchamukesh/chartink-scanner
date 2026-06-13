@@ -85,6 +85,39 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index — trend strength (0-100). >20 = trending, <20 = choppy."""
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm  = ((up_move > down_move) & (up_move > 0)) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+    tr  = _atr(high, low, close, period)
+    plus_di  = 100 * (plus_dm.ewm(com=period - 1, adjust=False).mean() / tr.replace(0, float("nan")))
+    minus_di = 100 * (minus_dm.ewm(com=period - 1, adjust=False).mean() / tr.replace(0, float("nan")))
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
+
+def _htf_trend(close: pd.Series) -> str:
+    """Resample 5m closes to 15m (groups of 3), EMA5 vs SMA50 trend."""
+    try:
+        n = len(close) // 3
+        if n < 55:
+            return "neutral"
+        c15 = pd.Series(close.iloc[: n * 3].values.reshape(n, 3)[:, -1])
+        ema5_15  = c15.ewm(span=5,  adjust=False).mean()
+        sma50_15 = c15.rolling(50).mean()
+        if math.isnan(sma50_15.iloc[-1]):
+            return "neutral"
+        if ema5_15.iloc[-1] > sma50_15.iloc[-1]:
+            return "bullish"
+        elif ema5_15.iloc[-1] < sma50_15.iloc[-1]:
+            return "bearish"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
@@ -192,6 +225,8 @@ def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
         "pe":          0,
         "swing_trend": swing_trend,
         "atr":         round(_safe(atr, -1), 2),
+        "adx":         round(_safe(_adx(high, low, close, 14), -1), 2),
+        "htf_trend":   _htf_trend(close),
         "timeframe":   "5m",
     }
 
@@ -303,6 +338,30 @@ def get_nifty_trend() -> str:
     except Exception as e:
         print(f"[data] Nifty trend error: {e}")
         return "bullish"   # safe default — allow signals if Nifty data unavailable
+
+
+def get_india_vix() -> float:
+    """
+    Current India VIX level. Used as a volatility-regime filter:
+      VIX < 14            → calm, normal operation
+      14 <= VIX <= 20     → elevated, widen stops
+      VIX > 20            → high fear, pause new signals
+    Returns 0.0 if unavailable (treated as calm/normal downstream).
+    """
+    try:
+        raw = yf.download("^INDIAVIX", period="5d", interval="5m",
+                          auto_adjust=True, progress=False)
+        if raw is None or raw.empty:
+            return 0.0
+        close = raw["Close"].dropna()
+        if close.empty:
+            return 0.0
+        vix = float(close.iloc[-1])
+        print(f"[data] India VIX: {vix:.2f}")
+        return round(vix, 2)
+    except Exception as e:
+        print(f"[data] VIX error: {e}")
+        return 0.0
 
 
 def get_all() -> list[dict]:

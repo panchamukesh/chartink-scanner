@@ -1,10 +1,11 @@
 """
-MarketScan Pro — Signal Engine (v2 — Quality over Quantity)
+MarketScan Pro — Signal Engine (v3 — Quality over Quantity + Confirmation Stack)
 
 Philosophy:
   - ONLY fire Pine Script crossover signals (4 rules total)
-  - Every signal passes 5 quality gates before Telegram
+  - Every signal passes a 10-gate confirmation stack before Telegram
   - ATR-based SL and Target (adapts to each stock's actual volatility)
+  - Trailing SL once a trade moves in favor — let winners run
   - Maximum 5 signals per day — if you're getting more, something is wrong
   - Zero noise tolerated
 
@@ -14,12 +15,17 @@ Pine Script rules (SWING CALLS by nicks1008):
   BUY  — RSI crosses above 20 (oversold reversal)
   SELL — RSI crosses below 80 (overbought reversal)
 
-Quality gates (ALL must pass):
-  1. Nifty trend   — BUY only when Nifty above EMA20, SELL only when below
-  2. Volume        — Signal candle volume > 1.5× 20-bar average
-  3. RSI guard     — Swing BUY: RSI < 70  |  Swing SELL: RSI > 30
-  4. Session time  — Only 10:15 AM – 3:00 PM IST (skip open/close noise)
-  5. Daily cap     — Max 5 signals per day total
+Quality / confirmation gates (ALL must pass):
+  1. Nifty trend     — BUY only when Nifty above EMA20, SELL only when below
+  2. Volume          — Signal candle volume > 1.5× 20-bar average
+  3. RSI guard       — Swing BUY: RSI < 70  |  Swing SELL: RSI > 30
+  4. Session time    — Only 10:15 AM – 3:00 PM IST (skip open/close noise)
+  5. Daily cap       — Max 5 signals per day total
+  6. ADX trend       — ADX(14) > 20 on 5m (skip choppy/sideways conditions)
+  7. HTF confirm     — 15-min (resampled) EMA5/SMA50 trend must agree with signal direction
+  8. 2-bar confirm   — condition must hold true for 2 consecutive 5m scan cycles
+  9. Sector cooldown — skip if an opposing signal fired in the same sector in last 30 min
+ 10. India VIX       — VIX > 22 pauses new signals; 14-22 widens SL by 1.5x
 """
 import threading
 import time as _time
@@ -31,9 +37,18 @@ import notify as _notify
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+ADX_MIN          = 20
+CONFIRM_CYCLES   = 2     # consecutive cycles a condition must hold
+SECTOR_COOLDOWN_MIN = 30
+VIX_PAUSE        = 22
+VIX_WIDEN        = 14
+VIX_WIDEN_MULT   = 1.5
+
 # ── In-memory state: tracks which stocks currently match each rule ─────────────
-_active: dict = {}          # rule_key → set[symbol]
+_active: dict  = {}             # rule_key → set[symbol]  (last cycle's matches)
+_pending: dict = {}              # rule_key → {symbol: consecutive_cycle_count}
 _nifty_trend: str = "bullish"   # updated each refresh cycle
+_india_vix: float = 0.0         # updated each refresh cycle
 
 
 # ── Pine Script rules ONLY (no generic indicator library) ─────────────────────
@@ -100,12 +115,14 @@ def _in_signal_window() -> bool:
     return _time_t(10, 15) <= t <= _time_t(15, 0)
 
 
-def _calc_targets(price: float, signal_type: str, atr: float = 0.0):
+def _calc_targets(price: float, signal_type: str, atr: float = 0.0, vix: float = 0.0):
     """
     ATR-based SL and Target.
       SL     = 1.5 × ATR  (tight enough to stop early, wide enough for noise)
       Target = 3.0 × ATR  (2:1 R:R minimum — only worth taking quality setups)
     Falls back to fixed 2% / 4% if ATR unavailable.
+    Gate 10 — if VIX is elevated (14-22), widen SL by 1.5x to avoid
+    getting stopped out by volatility noise rather than a real reversal.
     """
     if atr and atr > 0:
         sl_dist  = round(1.5 * atr, 2)
@@ -113,6 +130,9 @@ def _calc_targets(price: float, signal_type: str, atr: float = 0.0):
     else:
         sl_dist  = round(price * 0.02, 2)    # 2% fallback
         tgt_dist = round(price * 0.04, 2)    # 4% fallback
+
+    if vix and vix >= VIX_WIDEN:
+        sl_dist = round(sl_dist * VIX_WIDEN_MULT, 2)
 
     if signal_type == "BUY":
         return round(price + tgt_dist, 2), round(price - sl_dist, 2)
@@ -122,7 +142,7 @@ def _calc_targets(price: float, signal_type: str, atr: float = 0.0):
 
 def _passes_quality(stock: dict, rule: dict) -> tuple[bool, str]:
     """
-    5 quality gates — ALL must pass.
+    10-gate confirmation stack — ALL must pass.
     Returns (passed: bool, reason: str).
     """
     signal = rule["signal"]
@@ -153,36 +173,124 @@ def _passes_quality(stock: dict, rule: dict) -> tuple[bool, str]:
     if _db.count_today() >= MAX_SIGNALS_PER_DAY:
         return False, f"Daily cap of {MAX_SIGNALS_PER_DAY} reached"
 
+    # Gate 6 — ADX trend strength (skip choppy/sideways markets)
+    adx = stock.get("adx", 0)
+    if adx and adx < ADX_MIN:
+        return False, f"ADX too low ({adx}) — choppy/sideways, no real trend"
+
+    # Gate 7 — Higher-timeframe (15m) trend confirmation
+    htf = stock.get("htf_trend", "neutral")
+    if signal == "BUY" and htf == "bearish":
+        return False, "15m trend bearish — 5m BUY signal conflicts with HTF"
+    if signal == "SELL" and htf == "bullish":
+        return False, "15m trend bullish — 5m SELL signal conflicts with HTF"
+
+    # Gate 9 — Sector correlation: skip if an opposing signal fired recently in same sector
+    recent = _db.recent_signals_by_sector(stock["sector"], minutes=SECTOR_COOLDOWN_MIN)
+    for r in recent:
+        if r["signal_type"] != signal:
+            return False, (f"Opposing {r['signal_type']} signal fired for {r['symbol']} "
+                            f"({stock['sector']}) {SECTOR_COOLDOWN_MIN}min ago — conflicting sector signal")
+
+    # Gate 10 — India VIX regime
+    if _india_vix and _india_vix > VIX_PAUSE:
+        return False, f"India VIX too high ({_india_vix}) — pausing new signals"
+
     return True, "All gates passed ✅"
+
+
+# ── Trailing SL update ────────────────────────────────────────────────────────
+def _update_trailing_stops():
+    """
+    For every open position, once price has moved >= 1.5x ATR in favor,
+    trail the SL: first move to breakeven, then trail by 1x ATR behind price.
+    Also marks target_hit/sl_hit if the live price has crossed them.
+    """
+    stocks_by_sym = {s["symbol"]: s for s in _data.get_all()}
+    for pos in _db.get_open_positions():
+        stock = stocks_by_sym.get(pos["symbol"])
+        if not stock:
+            continue
+        price = stock["close"]
+        atr   = stock.get("atr", 0) or 0
+        entry = pos["price"]
+        sl    = pos["trailing_sl"] or pos["sl"]
+        target = pos["target"]
+        is_buy = pos["signal_type"] == "BUY"
+
+        # Check target / SL hit intraday
+        if is_buy:
+            if price >= target:
+                _db.update_position(pos["id"], target_hit=1, closed=1)
+                continue
+            if price <= sl:
+                _db.update_position(pos["id"], sl_hit=1, closed=1)
+                continue
+        else:
+            if price <= target:
+                _db.update_position(pos["id"], target_hit=1, closed=1)
+                continue
+            if price >= sl:
+                _db.update_position(pos["id"], sl_hit=1, closed=1)
+                continue
+
+        if not atr:
+            continue
+
+        # Trail once price has moved >= 1.5x ATR in favor
+        if is_buy:
+            moved = price - entry
+            if moved >= 1.5 * atr:
+                new_sl = max(sl, max(entry, price - 1.0 * atr))
+                if new_sl > sl:
+                    _db.update_position(pos["id"], trailing_sl=new_sl)
+        else:
+            moved = entry - price
+            if moved >= 1.5 * atr:
+                new_sl = min(sl, min(entry, price + 1.0 * atr))
+                if new_sl < sl:
+                    _db.update_position(pos["id"], trailing_sl=new_sl)
 
 
 # ── Main scan cycle ───────────────────────────────────────────────────────────
 def _run_scan_cycle():
     """
     Evaluate 4 Pine Script rules against live 5m data.
-    Only fire when a stock NEWLY enters a condition AND all 5 quality gates pass.
-    One Telegram message per stock per cooldown window (2h).
+    A stock must satisfy a rule's condition for 2 CONSECUTIVE cycles (gate 8)
+    before the remaining gates are even checked. One Telegram message per
+    stock per cooldown window (2h).
     """
-    global _nifty_trend
+    global _nifty_trend, _india_vix
 
     stocks = _data.get_all()
     if not stocks:
         print("[scanner] No data — skipping")
         return
 
-    # Refresh Nifty trend each cycle
+    # Refresh Nifty trend + India VIX each cycle
     try:
         _nifty_trend = _data.get_nifty_trend()
         print(f"[scanner] Nifty trend: {_nifty_trend}")
     except Exception as e:
         print(f"[scanner] Nifty trend error: {e}")
 
+    try:
+        _india_vix = _data.get_india_vix()
+    except Exception as e:
+        print(f"[scanner] VIX error: {e}")
+
+    # Trailing SL / position management for open trades
+    try:
+        _update_trailing_stops()
+    except Exception as e:
+        print(f"[scanner] Trailing SL error: {e}")
+
     fired = 0
 
     for rule in ACTIVE_RULES:
-        rkey     = rule["key"]
-        prev_set = _active.get(rkey, set())
-        curr_set = set()
+        rkey      = rule["key"]
+        pend      = _pending.setdefault(rkey, {})
+        curr_set  = set()
 
         for stock in stocks:
             try:
@@ -191,8 +299,19 @@ def _run_scan_cycle():
             except Exception:
                 continue
 
-        new_entries = curr_set - prev_set   # NEWLY matching stocks only
-        _active[rkey] = curr_set
+        # Gate 8 — 2-consecutive-cycle confirmation
+        confirmed_now = set()
+        for symbol in curr_set:
+            pend[symbol] = pend.get(symbol, 0) + 1
+            if pend[symbol] >= CONFIRM_CYCLES:
+                confirmed_now.add(symbol)
+        for symbol in list(pend.keys()):
+            if symbol not in curr_set:
+                del pend[symbol]
+
+        prev_confirmed = _active.get(rkey, set())
+        new_entries    = confirmed_now - prev_confirmed   # newly CONFIRMED stocks
+        _active[rkey]  = confirmed_now
 
         for symbol in new_entries:
             stock = next((s for s in stocks if s["symbol"] == symbol), None)
@@ -212,7 +331,7 @@ def _run_scan_cycle():
 
             price    = stock["close"]
             atr      = stock.get("atr", 0)
-            target, sl = _calc_targets(price, rule["signal"], atr=atr)
+            target, sl = _calc_targets(price, rule["signal"], atr=atr, vix=_india_vix)
             rr = round(abs(target - price) / abs(price - sl), 1) if abs(price - sl) > 0 else 0
 
             sig_id = _db.insert_signal(
@@ -278,7 +397,7 @@ def _loop():
     eod_sent_today = False
     last_scan      = None
 
-    print("[scanner] v2 started — Pine Script signals only, 5 quality gates active")
+    print("[scanner] v3 started — Pine Script signals + 10-gate confirmation stack active")
 
     while True:
         now = _ist_now()

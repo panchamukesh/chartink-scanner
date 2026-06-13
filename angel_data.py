@@ -168,6 +168,42 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index — trend strength (0-100). >20 = trending, <20 = choppy."""
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm  = ((up_move > down_move) & (up_move > 0)) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+    tr  = _atr(high, low, close, period)
+    plus_di  = 100 * (plus_dm.ewm(com=period - 1, adjust=False).mean() / tr.replace(0, float("nan")))
+    minus_di = 100 * (minus_dm.ewm(com=period - 1, adjust=False).mean() / tr.replace(0, float("nan")))
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
+
+def _htf_trend(close: pd.Series) -> str:
+    """
+    Resample 5m closes to 15m (groups of 3) and compute EMA5 vs SMA50 trend.
+    A 5m crossover signal is only trusted if the 15m trend agrees.
+    """
+    try:
+        n = len(close) // 3
+        if n < 55:
+            return "neutral"
+        c15 = pd.Series(close.iloc[: n * 3].values.reshape(n, 3)[:, -1])
+        ema5_15  = c15.ewm(span=5,  adjust=False).mean()
+        sma50_15 = c15.rolling(50).mean()
+        if math.isnan(sma50_15.iloc[-1]):
+            return "neutral"
+        if ema5_15.iloc[-1] > sma50_15.iloc[-1]:
+            return "bullish"
+        elif ema5_15.iloc[-1] < sma50_15.iloc[-1]:
+            return "bearish"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
 def _safe(series: pd.Series, idx: int = -1) -> float:
     try:
         v = float(series.iloc[idx])
@@ -258,6 +294,8 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
         "pe":          0,
         "swing_trend": swing_trend,
         "atr":         round(_safe(_atr(high, low, close, 14), -1), 2),
+        "adx":         round(_safe(_adx(high, low, close, 14), -1), 2),
+        "htf_trend":   _htf_trend(close),
         "timeframe":   "5m",
         "source":      "angel_one",
     }

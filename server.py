@@ -110,8 +110,7 @@ def tradingview_webhook():
         return jsonify({"ok": False, "error": "missing symbol or price"}), 400
 
     # ── Targets ───────────────────────────────────────────────────────────────
-    is_swing = True   # TradingView signals treated as swing calls
-    target, sl = scanner._calc_targets(price, signal_type, is_swing=is_swing)
+    target, sl = scanner._calc_targets(price, signal_type, atr=float(payload.get("atr", 0) or 0))
 
     # ── Find stock meta (name / sector) from universe ─────────────────────────
     meta = next((s for s in _data.UNIVERSE if s["symbol"] == symbol), None)
@@ -186,7 +185,7 @@ def webhook_test():
         meta     = next((s for s in _data.UNIVERSE if s["symbol"] == symbol), None)
         name     = meta["name"]   if meta else symbol
         sector   = meta["sector"] if meta else "—"
-        target, sl = scanner._calc_targets(price, signal_type, is_swing=True)
+        target, sl = scanner._calc_targets(price, signal_type)
         sig_id   = db.insert_signal(symbol, name, sector, signal_type, f"📡 {scan_name}", price, target, sl)
         sig      = dict(id=sig_id, symbol=symbol, name=name, sector=sector,
                         signal_type=signal_type, scan_name=f"📡 {scan_name}",
@@ -243,8 +242,7 @@ def test_scan():
         primary = rules[0]
 
         price    = stock["close"]
-        is_swing = primary["key"] in scanner.PINE_KEYS
-        target, sl = scanner._calc_targets(price, primary["signal"], is_swing=is_swing)
+        target, sl = scanner._calc_targets(price, primary["signal"], atr=stock.get("atr", 0))
 
         labels = [r["name"] for r in rules[:3]]
         if len(rules) > 3:
