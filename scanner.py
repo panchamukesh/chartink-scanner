@@ -473,7 +473,7 @@ def _loop():
         # Every 2 minutes — refresh + scan
         if _is_market_open() and opened_today:
             elapsed = (now - last_scan).seconds if last_scan else 999
-            if elapsed >= 120:
+            if elapsed >= 180:
                 try:
                     _data.smart_refresh()
                 except Exception as e:

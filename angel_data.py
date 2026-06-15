@@ -327,12 +327,12 @@ def refresh_universe(universe: list) -> dict:
             retries.append(sym_info)   # may have hit rate limit
 
         if i < len(universe) - 1:
-            time.sleep(1.1)   # 1.1s gap — safely within Angel One rate limit
+            time.sleep(1.6)   # widened — Mukesh-Market shares this Angel One account
 
     # Retry failed symbols with extra delay
     if retries:
         print(f"[angel] Retrying {len(retries)} symbols after rate-limit pause …")
-        time.sleep(5)
+        time.sleep(8)
         for sym_info in retries:
             sym     = sym_info["symbol"]
             candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
@@ -340,7 +340,7 @@ def refresh_universe(universe: list) -> dict:
                 stock = _compute(candles, sym_info)
                 if stock:
                     results[sym] = stock
-            time.sleep(1.5)
+            time.sleep(2.0)
 
     print(f"[angel] Refreshed {len(results)}/{len(universe)} symbols "
           f"@ {datetime.now(_IST).strftime('%H:%M:%S')} IST")
