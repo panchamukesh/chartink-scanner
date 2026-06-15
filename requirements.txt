@@ -4,5 +4,5 @@ yfinance>=0.2
 pandas>=2.0
 numpy>=1.26
 requests>=2.31
-playwright>=1.40
 pyotp>=2.9
+upstox-totp==1.0.8
