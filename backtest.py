@@ -1,7 +1,7 @@
 """
 MarketScan Pro — Backtester (v3 gates)
 
-Fetches recent 5m candle history per symbol from Angel One (max ~5 days on
+Fetches recent 5m candle history per symbol from Upstox (max ~5 days on
 FIVE_MINUTE interval) and replays the 4 Pine Script rules bar-by-bar with
 the same gate stack used live in scanner.py (minus things that need live
 state only, like Nifty trend / sector cooldown across symbols / VIX —
@@ -18,12 +18,12 @@ import math
 import pandas as pd
 
 import data as _data
-import angel_data as _angel
+import upstox_data as _upstox
 import scanner as _scanner
 
 
 def _rsi(close, period=14):
-    return _angel._rsi(close, period)
+    return _upstox._rsi(close, period)
 
 
 def _build_frame(candles):
@@ -38,8 +38,8 @@ def _indicators(df):
     df["ema5"]   = close.ewm(span=5, adjust=False).mean()
     df["sma50"]  = close.rolling(50).mean()
     df["rsi"]    = _rsi(close, 14)
-    df["atr"]    = _angel._atr(high, low, close, 14)
-    df["adx"]    = _angel._adx(high, low, close, 14)
+    df["atr"]    = _upstox._atr(high, low, close, 14)
+    df["adx"]    = _upstox._adx(high, low, close, 14)
     df["avgvol"] = vol.rolling(20).mean()
     return df
 
@@ -47,7 +47,7 @@ def _indicators(df):
 def _row_stock(df, i):
     """Build a stock-dict snapshot at bar i (mimics live data.py output)."""
     r, p = df.iloc[i], df.iloc[i - 1]
-    htf = _angel._htf_trend(df["close"].iloc[: i + 1])
+    htf = _upstox._htf_trend(df["close"].iloc[: i + 1])
     return {
         "close": r["close"], "high": r["high"], "low": r["low"],
         "changePct": (r["close"] - df["open"].iloc[0]) / df["open"].iloc[0] * 100 if df["open"].iloc[0] else 0,
@@ -60,10 +60,10 @@ def _row_stock(df, i):
 
 
 def run(symbols=None):
-    if not _angel.login():
-        print("Angel One login failed — cannot backtest"); return
+    if not _upstox.login():
+        print("Upstox login failed — cannot backtest"); return
     universe = [s for s in _data.UNIVERSE if not symbols or s["symbol"] in symbols]
-    _angel.build_token_map(universe)
+    _upstox.build_token_map(universe)
 
     stats = {r["key"]: {"signals": 0, "wins": 0, "losses": 0, "open": 0, "pnl": []} for r in _scanner.ACTIVE_RULES}
     # confirmation counters per (rule,symbol)
@@ -71,7 +71,7 @@ def run(symbols=None):
 
     for sym_info in universe:
         sym = sym_info["symbol"]
-        candles = _angel._fetch_candles(sym, interval="FIVE_MINUTE", days=5)
+        candles = _upstox._fetch_candles(sym, interval="FIVE_MINUTE", days=5)
         if not candles or len(candles) < 60:
             print(f"  {sym}: insufficient data, skip"); continue
         df = _indicators(_build_frame(candles))
@@ -155,7 +155,7 @@ def run(symbols=None):
     print("- Nifty-trend, sector-cooldown, daily-cap, India-VIX, session-window")
     print("  gates are NOT applied here (need live cross-symbol/market state).")
     print("  Real live win rate will be <= this backtest number.")
-    print(f"- Angel One FIVE_MINUTE history is capped at ~5 days, so sample")
+    print(f"- Upstox FIVE_MINUTE history is capped at ~5 days, so sample")
     print(f"  size ({total_sig} signals) is still small. Re-run weekly to build history.")
 
 

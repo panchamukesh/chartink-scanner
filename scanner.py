@@ -500,17 +500,17 @@ def _loop():
 def start():
     _db.init_db()
 
-    # Angel One init
+    # Upstox init
     try:
-        import angel_data as _angel
-        print("[scanner] Connecting to Angel One …")
-        if _angel.login():
-            _angel.build_token_map(_data.UNIVERSE)
-            print("[scanner] Angel One ready ✅")
+        import upstox_data as _upstox
+        print("[scanner] Connecting to Upstox …")
+        if _upstox.login():
+            _upstox.build_token_map(_data.UNIVERSE)
+            print("[scanner] Upstox ready ✅")
         else:
-            print("[scanner] Angel One login failed — using Yahoo Finance fallback")
+            print("[scanner] Upstox login failed — live data unavailable")
     except Exception as e:
-        print(f"[scanner] Angel One init error: {e}")
+        print(f"[scanner] Upstox init error: {e}")
 
     t = threading.Thread(target=_loop, daemon=True, name="scanner")
     t.start()

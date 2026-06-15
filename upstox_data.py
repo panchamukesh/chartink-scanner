@@ -1,159 +1,175 @@
 """
-Angel One SmartAPI — real-time NSE 5-minute candle data.
-No delay. No Yahoo Finance. Direct from exchange via your Angel One account.
+Upstox API v2 — real-time NSE 5-minute candle data.
 
 Credentials read from .env:
-  ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_MPIN, ANGEL_TOTP_SECRET
+  UPSTOX_API_KEY, UPSTOX_API_SECRET, UPSTOX_ACCESS_TOKEN
 """
 import os
 import math
 import time
+import gzip
+import json
 import threading
 import requests
-import pyotp
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
-try:
-    from SmartApi import SmartConnect
-except ImportError:
-    try:
-        from smartapi import SmartConnect
-    except ImportError:
-        SmartConnect = None
+_IST       = timezone(timedelta(hours=5, minutes=30))
+_BASE      = "https://api.upstox.com/v2"
+_lock      = threading.Lock()
+_token_map: dict = {}     # NSE symbol -> Upstox instrument key
+_ready     = False
 
-_IST      = timezone(timedelta(hours=5, minutes=30))
-_obj      = None          # SmartConnect session
-_lock     = threading.Lock()
-_token_map: dict = {}     # NSE symbol → Angel One instrument token
+_INTERVAL_MAP = {
+    "FIVE_MINUTE": "5minute",
+    "ONE_MINUTE":  "1minute",
+    "FIFTEEN_MINUTE": "15minute",
+    "THIRTY_MINUTE": "30minute",
+    "ONE_HOUR": "30minute",  # not used, placeholder
+    "ONE_DAY": "day",
+}
+
+
+def _headers():
+    token = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 def login() -> bool:
-    global _obj
-    if SmartConnect is None:
-        print("[angel] smartapi-python not installed — run: pip install smartapi-python")
-        return False
-
-    api_key  = os.environ.get("ANGEL_API_KEY", "")
-    client   = os.environ.get("ANGEL_CLIENT_CODE", "")
-    mpin     = os.environ.get("ANGEL_MPIN", "")
-    totp_key = os.environ.get("ANGEL_TOTP_SECRET", "")
-
-    if not all([api_key, client, mpin, totp_key]):
-        print("[angel] Missing credentials in .env")
+    """Upstox uses a long-lived access token — just validate it works."""
+    global _ready
+    token = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
+    if not token:
+        print("[upstox] Missing UPSTOX_ACCESS_TOKEN in .env")
         return False
 
     try:
-        totp = pyotp.TOTP(totp_key).now()
-        obj  = SmartConnect(api_key=api_key)
-        resp = obj.generateSession(client, mpin, totp)
-        if resp and resp.get("status"):
-            with _lock:
-                _obj = obj
-            print(f"[angel] ✅ Logged in — {client}")
+        resp = requests.get(f"{_BASE}/user/profile", headers=_headers(), timeout=15)
+        if resp.status_code == 200 and resp.json().get("status") == "success":
+            _ready = True
+            data = resp.json().get("data", {})
+            print(f"[upstox] Logged in — {data.get('user_name', data.get('user_id', ''))}")
             return True
-        print(f"[angel] Login failed: {resp.get('message','unknown')}")
+        print(f"[upstox] Login failed: {resp.status_code} {resp.text[:200]}")
+        _ready = False
         return False
     except Exception as e:
-        print(f"[angel] Login error: {e}")
+        print(f"[upstox] Login error: {e}")
+        _ready = False
         return False
-
-
-def _relogin():
-    print("[angel] Session expired — re-logging in …")
-    return login()
 
 
 # ─── Instrument token map ─────────────────────────────────────────────────────
-# Known NSE equity tokens (fallback if scrip master lookup misses them)
-_KNOWN_TOKENS = {
-    "RELIANCE": "2885",  "TCS": "11536",    "HDFCBANK": "1333",
-    "INFY": "1594",      "ICICIBANK": "4963","SBIN": "3045",
-    "LT": "11483",       "AXISBANK": "5900", "MARUTI": "10999",
-    "TATAMOTORS": "3456","SUNPHARMA": "3351","CIPLA": "694",
-    "ASIANPAINT": "236", "HINDUNILVR": "1394","NTPC": "11630",
-    "POWERGRID": "14977","TITAN": "3506",    "BAJFINANCE": "317",
-    "ADANIENT": "25",    "JSWSTEEL": "11723","ULTRACEMCO": "2770",
-    "GRASIM": "1232",    "WIPRO": "3787",    "HCLTECH": "7229",
-    "TECHM": "13538",    "BAJAJFINSV": "16675","KOTAKBANK": "1922",
-    "INDUSINDBK": "5258","DRREDDY": "881",   "ONGC": "2475",
-    "IOC": "1624",       "COALINDIA": "20374","TATASTEEL": "3499",
-    "HINDALCO": "1363",  "BHARTIARTL": "10604","ITC": "1660",
-    "HEROMOTOCO": "1348","EICHERMOT": "910", "DIVISLAB": "10940",
-    "PIDILITIND": "2664","AMBUJACEM": "1270","UPL": "11287",
-    "BRITANNIA": "547",  "IEX": "23650",     "IRCTC": "542358",
+_INDEX_KEYS = {
+    "NIFTY 50":   "NSE_INDEX|Nifty 50",
+    "NIFTY BANK": "NSE_INDEX|Nifty Bank",
+    "INDIA VIX":  "NSE_INDEX|India VIX",
 }
 
 
 def build_token_map(universe: list) -> bool:
     """
-    Download Angel One scrip master and map our stock symbols to tokens.
-    Falls back to hardcoded known tokens for any that are missing.
+    Download Upstox NSE instrument master (gzip JSON) and map our stock
+    symbols (trading_symbol) to instrument_key. Also adds index keys.
     """
     global _token_map
     needed = {s["symbol"] for s in universe}
-    tmap   = dict(_KNOWN_TOKENS)   # start with known tokens
+    tmap = {}
 
     try:
-        url  = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        data = requests.get(url, timeout=30).json()
-        for item in data:
-            if item.get("exch_seg") != "NSE":
-                continue
-            sym = item.get("symbol", "").replace("-EQ", "").strip()
-            if sym in needed:
-                tmap[sym] = str(item["token"])   # scrip master overrides hardcoded
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        resp = requests.get(url, timeout=60)
+        raw = gzip.decompress(resp.content)
+        instruments = json.loads(raw)
+        for item in instruments:
+            sym = item.get("trading_symbol", "")
+            seg = item.get("segment", "")
+            if sym in needed and seg == "NSE_EQ":
+                tmap[sym] = item.get("instrument_key")
+            # capture index keys if present in this file
+            name = item.get("name", "")
+            if seg in ("NSE_INDEX",) or item.get("instrument_type") == "INDEX":
+                if name.upper() in _INDEX_KEYS and _INDEX_KEYS[name.upper()] not in tmap.values():
+                    tmap[name.upper()] = item.get("instrument_key", _INDEX_KEYS.get(name.upper()))
     except Exception as e:
-        print(f"[angel] Scrip master download failed ({e}) — using hardcoded tokens")
+        print(f"[upstox] NSE instrument master download failed: {e}")
 
-    _token_map = {k: v for k, v in tmap.items() if k in needed}
-    missing    = needed - set(_token_map.keys())
-    print(f"[angel] Token map: {len(_token_map)}/{len(needed)} symbols "
-          f"{'| missing: ' + str(missing) if missing else '✅ all mapped'}")
+    # Fallback for indices — use known instrument keys if not found above
+    for idx_name, idx_key in _INDEX_KEYS.items():
+        if idx_name not in tmap:
+            tmap[idx_name] = idx_key
+
+    _token_map = tmap
+    missing = needed - set(_token_map.keys())
+    print(f"[upstox] Token map: {len(_token_map & needed) if False else len([k for k in _token_map if k in needed])}/{len(needed)} symbols "
+          f"{'| missing: ' + str(missing) if missing else '— all mapped'}")
     return True
 
 
 # ─── Candle fetch ─────────────────────────────────────────────────────────────
 def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 5):
-    """Fetch OHLCV candles from Angel One for one symbol."""
-    global _obj
-    token = _token_map.get(symbol)
-    if not token or _obj is None:
+    """Fetch OHLCV candles from Upstox for one symbol.
+    Returns [[timestamp, O, H, L, C, V], ...] sorted oldest->newest.
+    """
+    instrument_key = _token_map.get(symbol)
+    if not instrument_key:
         return None
 
-    now       = datetime.now(_IST).replace(tzinfo=None)
-    from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
-    to_date   = now.strftime("%Y-%m-%d %H:%M")
+    up_interval = _INTERVAL_MAP.get(interval, "5minute")
+    candles = []
 
-    params = {
-        "exchange":    "NSE",
-        "symboltoken": token,
-        "interval":    interval,
-        "fromdate":    from_date,
-        "todate":      to_date,
-    }
+    now = datetime.now(_IST)
+    from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = now.strftime("%Y-%m-%d")
 
-    try:
-        with _lock:
-            resp = _obj.getCandleData(params)
-    except Exception as e:
-        err = str(e).lower()
-        if "invalid" in err or "token" in err or "session" in err or "unauthori" in err:
-            _relogin()
-        print(f"[angel] Candle error {symbol}: {e}")
+    def _get(url):
+        for attempt in range(2):
+            try:
+                resp = requests.get(url, headers=_headers(), timeout=20)
+                if resp.status_code == 200:
+                    j = resp.json()
+                    if j.get("status") == "success":
+                        return j.get("data", {}).get("candles", [])
+                    return []
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                print(f"[upstox] Candle error {symbol}: {resp.status_code} {resp.text[:150]}")
+                return []
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                print(f"[upstox] Candle exception {symbol}: {e}")
+                return []
+        return []
+
+    # Historical candles (up to yesterday)
+    hist_to = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    hist_url = f"{_BASE}/historical-candle/{instrument_key}/{up_interval}/{hist_to}/{from_date}"
+    hist_candles = _get(hist_url)
+    candles.extend(hist_candles)
+
+    # Intraday candles (today)
+    intraday_url = f"{_BASE}/historical-candle/intraday/{instrument_key}/{up_interval}"
+    intraday_candles = _get(intraday_url)
+    candles.extend(intraday_candles)
+
+    if not candles:
         return None
 
-    if resp and resp.get("status") and resp.get("data"):
-        return resp["data"]  # [[timestamp, O, H, L, C, V], ...]
-
-    # Re-login on invalid session
-    if resp and "invalid" in str(resp.get("message", "")).lower():
-        _relogin()
-    return None
+    # Upstox candle format: [timestamp(ISO), open, high, low, close, volume, oi]
+    # Returns newest-first -> reverse to oldest->newest
+    candles.sort(key=lambda c: c[0])
+    out = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in candles]
+    return out
 
 
-# ─── Technical indicators ─────────────────────────────────────────────────────
+# ─── Technical indicators ──────────────────────────────────────────────────────
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
@@ -213,11 +229,10 @@ def _safe(series: pd.Series, idx: int = -1) -> float:
 
 
 def _compute(candles: list, sym_info: dict) -> dict | None:
-    """Convert raw Angel One candle list → stock dict with all indicators."""
+    """Convert raw Upstox candle list -> stock dict with all indicators."""
     if not candles or len(candles) < 55:
         return None
 
-    # Angel One: [timestamp_str, open, high, low, close, volume]
     df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -228,7 +243,6 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
     low    = df["low"]
     volume = df["volume"]
 
-    # ── Indicators on 5m bars ─────────────────────────────────────────────────
     ema5  = close.ewm(span=5,  adjust=False).mean()
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
@@ -256,10 +270,8 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
     day_open   = float(today_rows["open"].iloc[0]) if not today_rows.empty else cur_open
     change_pct = round((cur_close - day_open) / day_open * 100, 2) if day_open else 0.0
 
-    # Resistance = highest high in dataset
     resistance = round(float(high.max()), 2)
 
-    # Swing trend
     if cur_low > sma50_cur:
         swing_trend = "bullish"
     elif cur_high < sma50_cur:
@@ -297,7 +309,7 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
         "adx":         round(_safe(_adx(high, low, close, 14), -1), 2),
         "htf_trend":   _htf_trend(close),
         "timeframe":   "5m",
-        "source":      "angel_one",
+        "source":      "upstox",
     }
 
 
@@ -305,47 +317,56 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
 def refresh_universe(universe: list) -> dict:
     """
     Fetch 5m candles for all symbols, compute indicators.
-    Rate limit: Angel One allows ~1 req/sec on historical API.
-    Sleep 1.1s between calls → ~50s for 45 stocks (fits in 60s scan window).
-    Retries once on rate-limit errors.
+    Upstox allows ~20-25 req/sec for historical/intraday candle APIs,
+    but we use ~0.4s between calls to be safe. Simple retry-once on failure.
     """
-    if _obj is None:
-        print("[angel] Not logged in")
+    if not _ready:
+        print("[upstox] Not logged in")
         return {}
 
-    results   = {}
-    retries   = []   # symbols that hit rate limit — retry at end
-
+    results = {}
     for i, sym_info in enumerate(universe):
-        sym     = sym_info["symbol"]
+        sym = sym_info["symbol"]
         candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
+        if not candles:
+            time.sleep(0.5)
+            candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)  # retry once
         if candles:
             stock = _compute(candles, sym_info)
             if stock:
                 results[sym] = stock
-        else:
-            retries.append(sym_info)   # may have hit rate limit
-
         if i < len(universe) - 1:
-            time.sleep(1.6)   # widened — Mukesh-Market shares this Angel One account
+            time.sleep(0.4)
 
-    # Retry failed symbols with extra delay
-    if retries:
-        print(f"[angel] Retrying {len(retries)} symbols after rate-limit pause …")
-        time.sleep(8)
-        for sym_info in retries:
-            sym     = sym_info["symbol"]
-            candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
-            if candles:
-                stock = _compute(candles, sym_info)
-                if stock:
-                    results[sym] = stock
-            time.sleep(2.0)
-
-    print(f"[angel] Refreshed {len(results)}/{len(universe)} symbols "
+    print(f"[upstox] Refreshed {len(results)}/{len(universe)} symbols "
           f"@ {datetime.now(_IST).strftime('%H:%M:%S')} IST")
     return results
 
 
 def is_ready() -> bool:
-    return _obj is not None and bool(_token_map)
+    return _ready and bool(_token_map)
+
+
+# ─── India VIX ─────────────────────────────────────────────────────────────────
+def get_india_vix() -> float:
+    """Fetch India VIX LTP via Upstox quote API. Returns 0.0 on failure."""
+    try:
+        instrument_key = _token_map.get("INDIA VIX", "NSE_INDEX|India VIX")
+        url = f"{_BASE}/market-quote/quotes"
+        resp = requests.get(url, headers=_headers(), params={"instrument_key": instrument_key}, timeout=15)
+        if resp.status_code != 200:
+            print(f"[upstox] VIX error: {resp.status_code} {resp.text[:150]}")
+            return 0.0
+        j = resp.json()
+        if j.get("status") != "success":
+            return 0.0
+        data = j.get("data", {})
+        for v in data.values():
+            ltp = v.get("last_price")
+            if ltp is not None:
+                print(f"[upstox] India VIX: {float(ltp):.2f}")
+                return round(float(ltp), 2)
+        return 0.0
+    except Exception as e:
+        print(f"[upstox] VIX error: {e}")
+        return 0.0

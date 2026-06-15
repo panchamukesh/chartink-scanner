@@ -231,24 +231,24 @@ def _compute_5m(hist: pd.DataFrame, sym_info: dict) -> dict | None:
     }
 
 
-# ─── Angel One primary refresh ───────────────────────────────────────────────
-def _try_angel_refresh() -> bool:
-    """Try to refresh using Angel One real-time data. Returns True on success."""
+# ─── Upstox primary refresh ──────────────────────────────────────────────────
+def _try_upstox_refresh() -> bool:
+    """Try to refresh using Upstox real-time data. Returns True on success."""
     try:
-        import angel_data as _angel
-        if not _angel.is_ready():
+        import upstox_data as _upstox
+        if not _upstox.is_ready():
             return False
-        results = _angel.refresh_universe(UNIVERSE)
+        results = _upstox.refresh_universe(UNIVERSE)
         if not results:
             return False
         with _cache_lock:
             _cache.update(results)
         global _last_refresh
         _last_refresh = datetime.now()
-        print(f"[data] ✅ Angel One: {len(results)} stocks refreshed (real-time)")
+        print(f"[data] ✅ Upstox: {len(results)} stocks refreshed (real-time)")
         return True
     except Exception as e:
-        print(f"[data] Angel One refresh error: {e}")
+        print(f"[data] Upstox refresh error: {e}")
         return False
 
 
@@ -299,13 +299,13 @@ def refresh_5m():
 
 def smart_refresh():
     """
-    Primary: Angel One real-time 5m data (no delay).
-    Fallback: Yahoo Finance 5m data (~15 min delayed) if Angel One unavailable.
+    Live data only — Upstox real-time 5m data.
+    No mock/fallback data is generated; if Upstox is unavailable, the cache
+    simply does not get refreshed (stale/empty data is reported as-is).
     """
-    if _try_angel_refresh():
-        return   # Angel One succeeded — real-time data
-    print("[data] Angel One unavailable — falling back to Yahoo Finance (delayed)")
-    refresh_5m()
+    if _try_upstox_refresh():
+        return   # Upstox succeeded — real-time data
+    print("[data] Upstox unavailable — no live data refresh this cycle")
 
 
 # Aliases
@@ -321,7 +321,7 @@ def get_nifty_trend() -> str:
     """
     Returns 'bullish' if Nifty 50 is above its 20 EMA on 5m chart, else 'bearish'.
     Used as a market-wide filter — only take BUY signals in bullish market.
-    Uses yfinance for ^NSEI (single call, no Angel One rate impact).
+    Uses yfinance for ^NSEI (single call, separate from Upstox feed).
     """
     try:
         raw = yf.download("^NSEI", period="5d", interval="5m",
@@ -347,18 +347,11 @@ def get_india_vix() -> float:
       14 <= VIX <= 20     → elevated, widen stops
       VIX > 20            → high fear, pause new signals
     Returns 0.0 if unavailable (treated as calm/normal downstream).
+    Sourced from Upstox (consistent with live candle feed).
     """
     try:
-        raw = yf.download("^INDIAVIX", period="5d", interval="5m",
-                          auto_adjust=True, progress=False)
-        if raw is None or raw.empty:
-            return 0.0
-        close = raw["Close"].dropna()
-        if close.empty:
-            return 0.0
-        vix = float(close.iloc[-1])
-        print(f"[data] India VIX: {vix:.2f}")
-        return round(vix, 2)
+        import upstox_data as _upstox
+        return _upstox.get_india_vix()
     except Exception as e:
         print(f"[data] VIX error: {e}")
         return 0.0
