@@ -3,3 +3,5 @@ __pycache__/
 .env
 .DS_Store
 Thumbs.db
+watchlist.json
+alerts.json

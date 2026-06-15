@@ -20,13 +20,25 @@ _lock      = threading.Lock()
 _token_map: dict = {}     # NSE symbol -> Upstox instrument key
 _ready     = False
 
+# Upstox v2 candle endpoints only accept these intervals now:
+#   historical-candle: 1minute, 30minute, day, week, month
+#   intraday:          1minute, 30minute
+# For anything finer than 30minute we fetch 1minute candles and resample
+# locally with pandas. THIRTY_MINUTE can be fetched directly.
 _INTERVAL_MAP = {
-    "FIVE_MINUTE": "5minute",
+    "FIVE_MINUTE": "1minute",
     "ONE_MINUTE":  "1minute",
-    "FIFTEEN_MINUTE": "15minute",
+    "FIFTEEN_MINUTE": "1minute",
     "THIRTY_MINUTE": "30minute",
-    "ONE_HOUR": "30minute",  # not used, placeholder
+    "ONE_HOUR": "1minute",
     "ONE_DAY": "day",
+}
+
+# pandas resample rule for each interval that needs resampling from 1minute
+_RESAMPLE_RULE = {
+    "FIVE_MINUTE": "5min",
+    "FIFTEEN_MINUTE": "15min",
+    "ONE_HOUR": "60min",
 }
 
 
@@ -166,6 +178,24 @@ def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 5):
     # Returns newest-first -> reverse to oldest->newest
     candles.sort(key=lambda c: c[0])
     out = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in candles]
+
+    rule = _RESAMPLE_RULE.get(interval)
+    if rule:
+        df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(_IST)
+        df = df.set_index("ts")
+        agg = df.resample(rule, label="left", closed="left").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }).dropna(subset=["open"])
+        out = [
+            [ts.isoformat(), row.open, row.high, row.low, row.close, row.volume]
+            for ts, row in agg.iterrows()
+        ]
+
     return out
 
 

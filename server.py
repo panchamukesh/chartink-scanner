@@ -13,6 +13,7 @@ load_dotenv()
 
 import db
 import scanner
+import telegram_bot
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 
@@ -299,5 +300,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     db.init_db()
     scanner.start()
+    telegram_bot.start()
     print(f"[server] MarketScan Pro → http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

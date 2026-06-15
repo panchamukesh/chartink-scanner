@@ -49,6 +49,7 @@ _active: dict  = {}             # rule_key → set[symbol]  (last cycle's matche
 _pending: dict = {}              # rule_key → {symbol: consecutive_cycle_count}
 _nifty_trend: str = "bullish"   # updated each refresh cycle
 _india_vix: float = 0.0         # updated each refresh cycle
+_paused: bool = False            # when True, skip generating NEW signals (set via Telegram /pause)
 
 
 # ── Pine Script rules ONLY (no generic indicator library) ─────────────────────
@@ -286,6 +287,10 @@ def _run_scan_cycle():
         print(f"[scanner] Trailing SL error: {e}")
 
     fired = 0
+
+    if _paused:
+        print("[scanner] ⏸️  Paused — skipping new signal generation (trailing SL still active)")
+        return
 
     for rule in ACTIVE_RULES:
         rkey      = rule["key"]
