@@ -31,8 +31,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(ROOT, ".env")
 
 REDIRECT_CANDIDATES = [
+    "https://127.0.0.1",
     "https://127.0.0.1/callback",
     "https://localhost",
+    "https://127.0.0.1/",
+    "https://127.0.0.1:5000",
+    "https://localhost/",
+    "https://localhost/callback",
+    "http://127.0.0.1",
+    "http://localhost",
+    "https://127.0.0.1:3000",
 ]
 
 VM_HOST = "priya141ch@35.184.92.9"
