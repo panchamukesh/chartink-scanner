@@ -123,9 +123,15 @@ def build_token_map(universe: list) -> bool:
 
 
 # ─── Candle fetch ─────────────────────────────────────────────────────────────
-def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 5):
+def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 7):
     """Fetch OHLCV candles from Upstox for one symbol.
-    Returns [[timestamp, O, H, L, C, V], ...] sorted oldest->newest.
+    Returns [[timestamp_IST_isoformat, O, H, L, C, V], ...] sorted oldest->newest.
+
+    FIX (2026-06-25): days default raised 5→7 so that calendar-day lookback
+    always captures at least 4 full trading days even across a weekend or holiday.
+    FIX: deduplication of candles at the historical/intraday boundary.
+    FIX: resample anchored explicitly to 09:15 IST via 'offset' so bars land on
+         09:15, 09:20... regardless of the pandas default midnight anchor.
     """
     instrument_key = _token_map.get(symbol)
     if not instrument_key:
@@ -136,7 +142,6 @@ def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 5):
 
     now = datetime.now(_IST)
     from_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
-    to_date = now.strftime("%Y-%m-%d")
 
     def _get(url):
         for attempt in range(2):
@@ -175,16 +180,34 @@ def _fetch_candles(symbol: str, interval: str = "FIVE_MINUTE", days: int = 5):
         return None
 
     # Upstox candle format: [timestamp(ISO), open, high, low, close, volume, oi]
-    # Returns newest-first -> reverse to oldest->newest
+    # Sort oldest→newest, then deduplicate on timestamp (fixes hist/intraday boundary overlap)
     candles.sort(key=lambda c: c[0])
-    out = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in candles]
+    seen_ts = set()
+    deduped = []
+    for c in candles:
+        if c[0] not in seen_ts:
+            seen_ts.add(c[0])
+            deduped.append(c)
+    out = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in deduped]
 
     rule = _RESAMPLE_RULE.get(interval)
     if rule:
         df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(_IST)
+        # Parse timestamps — Upstox returns IST ISO strings (+05:30); convert correctly.
+        df["ts"] = pd.to_datetime(df["ts"], utc=False)
+        # If timestamps are already tz-aware (have +05:30), tz_convert to IST.
+        # If tz-naive, localize as IST directly.
+        if df["ts"].dt.tz is None:
+            df["ts"] = df["ts"].dt.tz_localize(_IST)
+        else:
+            df["ts"] = df["ts"].dt.tz_convert(_IST)
         df = df.set_index("ts")
-        agg = df.resample(rule, label="left", closed="left").agg({
+        # Anchor resample to 09:15 IST (market open) so bars land on 09:15, 09:20...
+        # The offset="15min" shifts the default midnight anchor by 15 minutes,
+        # producing boundaries at 09:15, 09:20... for a "5min" rule.
+        # For 15min rule, offset="15min" → 09:15, 09:30... which is correct.
+        # For 60min rule, offset="15min" → 09:15, 10:15... which is correct.
+        agg = df.resample(rule, label="left", closed="left", offset="15min").agg({
             "open": "first",
             "high": "max",
             "low": "min",
@@ -294,9 +317,21 @@ def _compute(candles: list, sym_info: dict) -> dict | None:
     rsi_cur    = _safe(rsi,   -1) or 50.0
     rsi_prv    = _safe(rsi,   -2) or 50.0
 
-    # Day open = first candle of today
+    # Day open = first candle of today (IST date)
+    # FIX: parse ts column properly before date-filtering; str.startswith works on
+    # IST isoformat strings ("2026-06-25T09:15:00+05:30") but is fragile.
+    # Use explicit date extraction instead.
     today_str  = datetime.now(_IST).strftime("%Y-%m-%d")
-    today_rows = df[df["ts"].astype(str).str.startswith(today_str)]
+    try:
+        ts_parsed = pd.to_datetime(df["ts"], utc=False)
+        if ts_parsed.dt.tz is None:
+            ts_parsed = ts_parsed.dt.tz_localize(_IST)
+        else:
+            ts_parsed = ts_parsed.dt.tz_convert(_IST)
+        today_mask = ts_parsed.dt.strftime("%Y-%m-%d") == today_str
+        today_rows = df[today_mask]
+    except Exception:
+        today_rows = df[df["ts"].astype(str).str.startswith(today_str)]
     day_open   = float(today_rows["open"].iloc[0]) if not today_rows.empty else cur_open
     change_pct = round((cur_close - day_open) / day_open * 100, 2) if day_open else 0.0
 
@@ -357,10 +392,10 @@ def refresh_universe(universe: list) -> dict:
     results = {}
     for i, sym_info in enumerate(universe):
         sym = sym_info["symbol"]
-        candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)
+        candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=7)
         if not candles:
             time.sleep(0.5)
-            candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=5)  # retry once
+            candles = _fetch_candles(sym, interval="FIVE_MINUTE", days=7)  # retry once
         if candles:
             stock = _compute(candles, sym_info)
             if stock:

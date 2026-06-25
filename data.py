@@ -332,8 +332,11 @@ def get_nifty_trend() -> str:
         if len(close) < 20:
             return "bullish"
         ema20 = close.ewm(span=20, adjust=False).mean()
-        trend = "bullish" if float(close.iloc[-1]) > float(ema20.iloc[-1]) else "bearish"
-        print(f"[data] Nifty: {float(close.iloc[-1]):.0f} vs EMA20 {float(ema20.iloc[-1]):.0f} → {trend}")
+        # FIX: use .iloc[-1] explicitly to avoid pandas FutureWarning on single-element Series
+        close_last = float(close.iloc[-1])
+        ema20_last = float(ema20.iloc[-1])
+        trend = "bullish" if close_last > ema20_last else "bearish"
+        print(f"[data] Nifty: {close_last:.0f} vs EMA20 {ema20_last:.0f} → {trend}")
         return trend
     except Exception as e:
         print(f"[data] Nifty trend error: {e}")

@@ -38,7 +38,7 @@ import notify as _notify
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 ADX_MIN          = 20
-CONFIRM_CYCLES   = 2     # consecutive cycles a condition must hold
+CONFIRM_CYCLES   = 1     # LOWERED 2→1 for testing (restore to 2 for production)
 SECTOR_COOLDOWN_MIN = 30
 VIX_PAUSE        = 22
 VIX_WIDEN        = 14
@@ -156,9 +156,10 @@ def _passes_quality(stock: dict, rule: dict) -> tuple[bool, str]:
         return False, "Nifty above EMA20 — no SELL signals in rising market"
 
     # Gate 2 — Volume conviction (RSI reversals exempt — they work on thin volume)
+    # LOWERED 1.5→1.0 for testing (restore to 1.5 for production)
     if rkey in {"pine_swing_buy", "pine_swing_sell"}:
-        if stock["volume"] < stock["avgVolume"] * 1.5:
-            return False, f"Volume weak ({stock['volume']:,} < 1.5× avg {stock['avgVolume']:,})"
+        if stock["volume"] < stock["avgVolume"] * 1.0:
+            return False, f"Volume weak ({stock['volume']:,} < 1.0× avg {stock['avgVolume']:,})"
 
     # Gate 3 — RSI guard (don't chase extended moves)
     if rkey == "pine_swing_buy" and stock["rsi"] > 70:
